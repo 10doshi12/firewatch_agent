@@ -32,11 +32,20 @@ import json
 import os
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
 import yaml
+
+# Exit codes consumed by hf_space_sft_worker/start.sh — DO NOT renumber.
+# 0 = step succeeded, 1 = error, 2 = campaign complete (no more work),
+# 3 = CUDA OOM (worker reduces batch / seq length on next loop).
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_CAMPAIGN_COMPLETE = 2
+EXIT_OOM = 3
 
 # ---------------------------------------------------------------------------
 # Resolve project paths
@@ -114,7 +123,42 @@ def load_config(config_path: Path | None = None) -> dict:
             print(
                 f"[train] Applied sft_regression_override.yaml: learning_rate {base_lr} -> {sft['learning_rate']}"
             )
+    _apply_sft_env_overrides(cfg)
     return cfg
+
+
+def _apply_sft_env_overrides(cfg: dict) -> None:
+    """
+    Optional runtime overrides for GPU-specific tuning (e.g. A100 Spaces).
+
+    These env vars are intentionally narrow and SFT-scoped so we can tune
+    throughput without mutating committed config files.
+    """
+    sft = cfg.setdefault("sft", {})
+    env_map: dict[str, tuple[str, type]] = {
+        "SFT_BATCH_SIZE": ("per_device_train_batch_size", int),
+        "SFT_GRAD_ACCUM": ("gradient_accumulation_steps", int),
+        "SFT_MAX_SEQ_LENGTH": ("max_seq_length", int),
+        "SFT_EPOCHS": ("llm_epochs_per_batch", int),
+        "SFT_LEARNING_RATE": ("learning_rate", float),
+        "SFT_WARMUP_RATIO": ("warmup_ratio", float),
+        "SFT_MAX_PROMPT_LENGTH": ("max_prompt_length", int),
+        "SFT_MAX_COMPLETION_LENGTH": ("max_completion_length", int),
+    }
+    applied: list[str] = []
+    for env_key, (cfg_key, cast) in env_map.items():
+        raw = os.environ.get(env_key)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = cast(raw)
+        except Exception:
+            print(f"[train] WARNING: ignored invalid {env_key}={raw!r}")
+            continue
+        sft[cfg_key] = value
+        applied.append(f"{cfg_key}={value}")
+    if applied:
+        print("[train] Applied env SFT overrides: " + ", ".join(applied))
 
 
 def trl_sft_sequence_kwargs(max_seq_length: int) -> dict[str, int]:
@@ -517,6 +561,62 @@ def auto_trigger_baseline(
         print(f"[train] Baseline evaluation failed (non-fatal): {exc}")
 
 
+def _pretrain_baseline_already_recorded(namespace: str, local_dir: Path) -> bool:
+    """
+    True iff the dataset's baselines log already contains a pretrain entry.
+    Hub is the source of truth — this lets the worker idempotently re-enter
+    `run_sft_batch` without re-running the untrained baseline.
+    """
+    try:
+        repo_id = f"{namespace}/firewatch-sft-data"
+        log_path = hf_io.pull_baselines_log(repo_id, local_dir, repo_type="dataset")
+    except TypeError:
+        # Older hf_io without repo_type kwarg — assume not recorded.
+        return False
+    except Exception as exc:
+        print(f"[train] Could not check pretrain marker: {exc}")
+        return False
+    if log_path is None or not log_path.exists():
+        return False
+    try:
+        for raw in log_path.read_text().splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if entry.get("model_variant") == "untrained" or entry.get("trigger") == "pretrain":
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def maybe_run_pretrain_baseline(namespace: str, local_dir: Path) -> None:
+    """
+    Run the untrained-model baseline ONCE (before training-run 0). Idempotent:
+    once the record lives in the dataset's baselines/metrics.jsonl, this is a
+    no-op on every subsequent worker loop / Space restart.
+    """
+    if os.environ.get("SKIP_PRETRAIN_BASELINE", "").lower() in ("1", "true", "yes"):
+        print("[train] SKIP_PRETRAIN_BASELINE — skipping untrained baseline anchor")
+        return
+    if _pretrain_baseline_already_recorded(namespace, local_dir):
+        return
+    print("[train] === Pretrain baseline (untrained GNN + base LLM) ===")
+    try:
+        from eval.baseline import run_baseline  # type: ignore[import]
+        run_baseline(
+            model_variant="untrained",
+            trigger="pretrain",
+            auto_triggered=False,
+        )
+    except ImportError:
+        print("[train] eval.baseline missing; skipping pretrain anchor")
+    except Exception as exc:
+        # Non-fatal — SFT continues. The next worker loop will retry.
+        print(f"[train] Pretrain baseline failed (non-fatal): {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Main orchestrator
 # ---------------------------------------------------------------------------
@@ -575,15 +675,17 @@ def _run_single_sft_step(
         print(
             f"\n[train] === Phase 3: Train GNN (all data batches 0..{step_idx - 1:03d} + current) ==="
         )
-        all_gnn_examples = pull_all_reviewed_batches(
-            namespace, step_idx, local_dir
-        ) + examples
+        prev_acc = pull_all_reviewed_batches(namespace, step_idx, local_dir)
+        all_gnn_examples = prev_acc + examples
 
     if not all_gnn_examples:
         raise RuntimeError(
             f"[train] No examples available for GNN training at step {step_idx:03d}"
         )
-    print(f"[train] GNN training on {len(all_gnn_examples)} accumulated examples")
+    print(
+        f"[train] GNN training on {len(all_gnn_examples)} accumulated examples "
+        f"({len(examples)} current new, {len(prev_acc)} prior accumulated)"
+    )
 
     gnn_ckpt_path, gnn_norm_path = train_gnn(
         batch_examples=all_gnn_examples,
@@ -661,7 +763,7 @@ def _run_single_sft_step(
         print("[train] SKIP_AUTO_BASELINE — no post-SFT baseline this step")
 
 
-def run_sft_batch(config_path: Path | None = None) -> None:
+def run_sft_batch(config_path: Path | None = None) -> int:
     """
     Run the 7-phase SFT pipeline for one or more steps (``MAX_SFT_STEPS``, default 1).
     """
@@ -690,11 +792,19 @@ def run_sft_batch(config_path: Path | None = None) -> None:
     local_dir = WORKING_DIR / "sft_run"
     local_dir.mkdir(parents=True, exist_ok=True)
 
+    # Anchor the baseline-progression chart with one untrained-model run before
+    # any training. Idempotent — does nothing once the record is on the Hub.
+    maybe_run_pretrain_baseline(namespace, local_dir)
+
+    steps_completed = 0
     for _ in range(max_steps):
         print("\n[train] === Phase 1: Detect next SFT step ===")
         step_idx = detect_current_batch(namespace, campaign)
         if step_idx is None:
-            return
+            if steps_completed == 0:
+                print("[train] Campaign complete — no untrained runs remain.")
+                return EXIT_CAMPAIGN_COMPLETE
+            break
 
         label = (
             f"training run {step_idx}/{TRAINING_RUNS_PAIRED - 1} (paired)"
@@ -711,18 +821,30 @@ def run_sft_batch(config_path: Path | None = None) -> None:
             config=config,
             local_dir=local_dir,
         )
+        steps_completed += 1
         print(
             f"[train] Step wall time: {time.monotonic() - step_start:.1f}s"
         )
 
     wall_time = time.monotonic() - start_time
-    print(f"\n[train] === Invocation complete ({max_steps} step(s)) ===")
+    print(f"\n[train] === Invocation complete ({steps_completed} step(s)) ===")
     print(f"[train] Total wall time: {wall_time:.1f}s")
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
+
+
+def _is_oom_error(exc: BaseException) -> bool:
+    """Return True for CUDA-OOM-shaped errors regardless of exact subclass."""
+    oom_cls = getattr(torch.cuda, "OutOfMemoryError", None)
+    if oom_cls is not None and isinstance(exc, oom_cls):
+        return True
+    if isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower():
+        return True
+    return False
 
 
 def main() -> None:
@@ -736,7 +858,21 @@ def main() -> None:
         help="Path to config.yaml (default: firewatch_agent/config.yaml)",
     )
     args = parser.parse_args()
-    run_sft_batch(config_path=args.config)
+    try:
+        code = run_sft_batch(config_path=args.config)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("[train] FATAL: interrupted")
+        sys.exit(EXIT_ERROR)
+    except BaseException as exc:  # noqa: BLE001 — top-level boundary
+        if _is_oom_error(exc):
+            print(f"[train] FATAL: CUDA OOM: {exc}")
+            sys.exit(EXIT_OOM)
+        print(f"[train] FATAL: {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        sys.exit(EXIT_ERROR)
+    sys.exit(code if code is not None else EXIT_OK)
 
 
 if __name__ == "__main__":

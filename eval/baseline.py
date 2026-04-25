@@ -24,6 +24,7 @@ import argparse
 import gc
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -110,6 +111,18 @@ def _parse_variant(variant: str) -> dict:
             "batch_num": None,
             "checkpoint_num": None,
             "use_gnn": False,
+            "lora_repo_suffix": None,
+            "lora_subfolder": None,
+        }
+
+    if variant == "untrained":
+        # Pre-training baseline: base LLM (no LoRA) + freshly initialized GNN.
+        # Used once at step 0 before any SFT to anchor the baseline-progression chart.
+        return {
+            "type": "untrained",
+            "batch_num": None,
+            "checkpoint_num": None,
+            "use_gnn": True,
             "lora_repo_suffix": None,
             "lora_subfolder": None,
         }
@@ -361,6 +374,18 @@ def _load_models(
             logger.info("Loaded normalizer from %s (n=%d)", norm_path, normalizer.n)
         else:
             logger.warning("Normalization stats not found at %s", norm_path)
+    elif use_gnn and gnn_path is None:
+        # Untrained-baseline path: instantiate a fresh GNN with random weights so
+        # the runner can still produce blurbs (a deliberate ablation anchor).
+        gnn_model = GraphSAGEModel(
+            in_channels=NUM_FEATURES,
+            hidden=gnn_config.get("hidden_dim", 64),
+            num_classes=NUM_SERVICES,
+            dropout=gnn_config.get("dropout", 0.1),
+        )
+        gnn_model.eval()
+        normalizer = WelfordNormalizer(num_features=NUM_FEATURES)
+        logger.info("Initialized fresh GNN (no checkpoint pulled — pretrain baseline path)")
 
     return model, tokenizer, gnn_model, normalizer
 
@@ -525,8 +550,15 @@ def run_baseline(
     sft_config = config.get("sft", {})
     gnn_config = config.get("gnn", {})
 
-    sim_url = config.get("sim_env_url", "https://10doshi12-firewatch-env.hf.space")
-    num_episodes = sft_config.get("baseline_sim_episodes", 20)
+    # Resolution order: env var (set by start.sh to local in-Space server)
+    # > config.sft.baseline_sim_url > legacy config.sim_env_url > public Space.
+    sim_url = (
+        os.environ.get("FIREWATCH_SIM_URL")
+        or sft_config.get("baseline_sim_url")
+        or config.get("sim_env_url")
+        or "https://10doshi12-firewatch-env.hf.space"
+    )
+    num_episodes = sft_config.get("baseline_sim_episodes", 60)
 
     # Parse variant
     variant_info = _parse_variant(model_variant)

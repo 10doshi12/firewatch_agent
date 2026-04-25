@@ -30,7 +30,7 @@ sft:
     - gate_proj
     - up_proj
     - down_proj
-  llm_epochs_per_batch: 3
+  llm_epochs_per_batch: 15
   per_device_train_batch_size: 1
   gradient_accumulation_steps: 8
   learning_rate: 2.0e-5
@@ -40,7 +40,10 @@ sft:
   max_completion_length: 256
   optimizer: "adamw_8bit"
   fallback_optimizer: "adamw_torch"
-  baseline_sim_episodes: 20
+  baseline_sim_episodes: 60
+  # Local FastAPI sim_env URL inside the HF Space (start.sh launches the env on
+  # 127.0.0.1:8000 in its own venv). FIREWATCH_SIM_URL env var wins if set.
+  baseline_sim_url: "http://127.0.0.1:8000"
   # After each post-SFT baseline, compare to previous Hub metrics; optional override file.
   regression_guard: true
   regression_min_delta_success_rate: 0.0

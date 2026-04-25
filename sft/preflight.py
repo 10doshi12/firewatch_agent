@@ -35,6 +35,13 @@ class PreflightResult:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     details: dict[str, str | int | float | bool | None] = field(default_factory=dict)
+    campaign_done: bool = False
+
+
+# Exit codes match firewatch_agent/sft/train.py — kept in sync with start.sh.
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_CAMPAIGN_COMPLETE = 2
 
 
 REQUIRED_REPOS: tuple[tuple[str, str, bool], ...] = (
@@ -137,6 +144,27 @@ def run_preflight(
     batch_num = detected_batch
     errors.extend(batch_errors)
 
+    # Campaign complete: auth + repos OK and detection cleanly returned None.
+    # Skip Unsloth/CUDA/disk checks — there's no training to gate.
+    campaign_done = (
+        not errors
+        and batch_num is None
+        and not batch_errors
+    )
+    if campaign_done:
+        details["namespace"] = namespace
+        details["batch_num"] = None
+        details["campaign_done"] = True
+        return PreflightResult(
+            ok=True,
+            namespace=namespace,
+            batch_num=None,
+            errors=errors,
+            warnings=warnings,
+            details=details,
+            campaign_done=True,
+        )
+
     if batch_num is not None:
         local_dir = WORKING_DIR / "sft_preflight"
         local_dir.mkdir(parents=True, exist_ok=True)
@@ -204,7 +232,10 @@ def main() -> None:
     if not result.ok:
         for error in result.errors:
             print(f"ERROR: {error}")
-        sys.exit(1)
+        sys.exit(EXIT_ERROR)
+    if result.campaign_done:
+        print("OK: SFT campaign complete — no untrained runs remain")
+        sys.exit(EXIT_CAMPAIGN_COMPLETE)
     print("OK: SFT preflight passed")
 
 

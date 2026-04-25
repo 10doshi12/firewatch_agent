@@ -226,10 +226,16 @@ def pull_gnn_checkpoint(batch_num: int, local_dir: Path) -> Path | None:
     return local_path
 
 
-def pull_baselines_log(repo_id: str, local_dir: Path) -> Path | None:
+def pull_baselines_log(
+    repo_id: str,
+    local_dir: Path,
+    repo_type: str = "dataset",
+) -> Path | None:
     """
     Download baselines/metrics.jsonl from the given repo.
     Returns None if the file doesn't exist yet (pre-first-batch).
+
+    repo_type defaults to "dataset" — pass "model" for the SFT model repo.
     """
     local_dir = Path(local_dir)
     filename = "baselines/metrics.jsonl"
@@ -237,7 +243,7 @@ def pull_baselines_log(repo_id: str, local_dir: Path) -> Path | None:
     def _download():
         return snapshot_download(
             repo_id=repo_id,
-            repo_type="dataset",
+            repo_type=repo_type,
             allow_patterns=[filename],
             local_dir=local_dir,
             token=hf_auth.get_token(),
