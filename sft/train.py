@@ -313,7 +313,7 @@ def load_llm_and_train(
             )
     else:
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-        from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+        from peft import LoraConfig, PeftModel, get_peft_model
 
         # Load with 4-bit quantization if bitsandbytes available
         bnb_config = None
@@ -339,12 +339,18 @@ def load_llm_and_train(
             model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=chosen_dtype, **load_kwargs)
         tokenizer = AutoTokenizer.from_pretrained(base_model)
 
-        # Required when applying LoRA on a 4-bit/8-bit quantized base — without this,
-        # input embeddings are not cast to fp32 and gradient flow into LoRA layers is broken.
-        if bnb_config is not None:
-            model = prepare_model_for_kbit_training(
-                model, use_gradient_checkpointing=True
-            )
+        # NOTE: We deliberately skip peft.prepare_model_for_kbit_training here. That
+        # helper iterates every parameter and casts fp16/bf16 → fp32, which doubles
+        # the memory of (un-quantized) embedding/lm_head/layernorm weights. On a T4
+        # with a 14B 4-bit base, the embedding cast alone OOMs (~2.9 GB delta with
+        # only ~2.3 GB free). The two things that helper does that we actually need:
+        #   1) freeze base params  → already done by get_peft_model
+        #   2) make input embeddings produce gradients so LoRA on q/k/v gets signal
+        # We do (2) directly via enable_input_require_grads(). Embeddings stay fp16;
+        # bnb_4bit_compute_dtype=fp16 means the matmul still happens in fp16, and the
+        # LoRA adapter weights themselves are created in fp32 by peft.
+        if bnb_config is not None and hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
 
         if prev_lora_path and prev_lora_path.exists():
             model = PeftModel.from_pretrained(model, str(prev_lora_path), is_trainable=True)
