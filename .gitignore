@@ -1,0 +1,43 @@
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+wheels/
+
+# Training artifacts (large binaries, generated at runtime)
+checkpoints/
+sft_data/
+*.pt
+*.safetensors
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+debug.log
+
+# Lock file (managed by uv, can be large)
+# uv.lock is committed for reproducibility — do NOT gitignore it
+
+# Jupyter
+.ipynb_checkpoints/

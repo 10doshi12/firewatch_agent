@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "run_id": "wider_menu_1777117073",
+  "started_at": "2026-04-25T11:37:53Z",
+  "backend": "ollama",
+  "model": "minimax-m2.7:cloud",
+  "gnn_mode": "heuristic",
+  "policy_inform_agent": false
+}

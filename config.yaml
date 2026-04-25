@@ -1,0 +1,55 @@
+# config.yaml — FirewatchEnv Training Pipeline Configuration
+# Consumed by sft/train.py and downstream modules.
+# Repo IDs are constructed at call time: <hf_namespace>/<repo-role-suffix>
+
+hf_namespace: null  # falls back to HF_NAMESPACE env var or authenticated HF username
+sim_env_url: "https://10doshi12-firewatch-env.hf.space"
+
+sft:
+  # 14B profile tuned for Colab/Kaggle VRAM constraints.
+  base_model: "unsloth/Qwen2.5-14B-Instruct-bnb-4bit"
+  max_seq_length: 1536
+  lora_rank: 16
+  lora_alpha: 16
+  lora_dropout: 0.0
+  lora_target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  llm_epochs_per_batch: 3
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-5
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.1
+  max_prompt_length: 1024
+  max_completion_length: 256
+  optimizer: "adamw_8bit"
+  baseline_sim_episodes: 20
+
+gnn:
+  hidden_dim: 64
+  num_layers: 2
+  dropout: 0.1
+  learning_rate: 1.0e-3
+  max_epochs: 100
+  patience: 10
+  in_channels: 32  # 21 ServiceMetrics + 3 status one-hot + 8 Phase 2/3 fields
+
+grpo:
+  num_generations: 8
+  base_seed: 1000
+  learning_rate: 1.0e-5
+  num_train_epochs: 3
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4
+  max_prompt_length: 2048
+  max_completion_length: 256
+  max_grad_norm: 0.1
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.1
+  save_steps: 50
