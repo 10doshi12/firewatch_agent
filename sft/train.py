@@ -313,7 +313,7 @@ def load_llm_and_train(
             )
     else:
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-        from peft import LoraConfig, get_peft_model, PeftModel
+        from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 
         # Load with 4-bit quantization if bitsandbytes available
         bnb_config = None
@@ -327,16 +327,27 @@ def load_llm_and_train(
         except Exception:
             print("[train] bitsandbytes 4-bit not available, loading in fp16")
 
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            quantization_config=bnb_config,
-            device_map={"": 0} if torch.cuda.is_available() else "cpu",
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        )
+        # transformers >=4.50 deprecated `torch_dtype` in favour of `dtype`; fall back for older builds.
+        load_kwargs = {
+            "quantization_config": bnb_config,
+            "device_map": {"": 0} if torch.cuda.is_available() else "cpu",
+        }
+        chosen_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        try:
+            model = AutoModelForCausalLM.from_pretrained(base_model, dtype=chosen_dtype, **load_kwargs)
+        except TypeError:
+            model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=chosen_dtype, **load_kwargs)
         tokenizer = AutoTokenizer.from_pretrained(base_model)
 
+        # Required when applying LoRA on a 4-bit/8-bit quantized base — without this,
+        # input embeddings are not cast to fp32 and gradient flow into LoRA layers is broken.
+        if bnb_config is not None:
+            model = prepare_model_for_kbit_training(
+                model, use_gradient_checkpointing=True
+            )
+
         if prev_lora_path and prev_lora_path.exists():
-            model = PeftModel.from_pretrained(model, str(prev_lora_path))
+            model = PeftModel.from_pretrained(model, str(prev_lora_path), is_trainable=True)
             print(f"[train] Loaded previous LoRA from {prev_lora_path}")
         else:
             lora_config = LoraConfig(
@@ -378,9 +389,14 @@ def load_llm_and_train(
         train_texts.append(text)
 
     # --- Configure SFTTrainer ---
-    from trl import SFTTrainer, SFTConfig
+    from trl import SFTConfig, SFTTrainer
 
-    training_args = SFTConfig(
+    # Disable KV cache during training when using gradient checkpointing — they conflict
+    # and HF emits a warning + silently disables checkpointing if cache is left enabled.
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+
+    sftconfig_kwargs = dict(
         output_dir=str(output_dir),
         num_train_epochs=epochs,
         per_device_train_batch_size=batch_size,
@@ -389,14 +405,23 @@ def load_llm_and_train(
         lr_scheduler_type=scheduler,
         warmup_ratio=warmup_ratio,
         optim=optimizer_name,
-        **trl_sft_sequence_kwargs(max_seq_length),
         save_strategy="epoch",
         save_total_limit=1,
         report_to="none",
         logging_steps=1,
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
+        dataset_text_field="text",
     )
+    sftconfig_kwargs.update(trl_sft_sequence_kwargs(max_seq_length))
+    # Gradient checkpointing is required for 14B 4-bit on a 15GB T4 — without it the
+    # backward pass OOMs at batch_size=1, max_seq_length=1536. Unsloth path enables this
+    # internally; here we set it via SFTConfig for the transformers+peft fallback.
+    if not use_unsloth:
+        sftconfig_kwargs["gradient_checkpointing"] = True
+        sftconfig_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+
+    training_args = SFTConfig(**sftconfig_kwargs)
 
     from datasets import Dataset
 
