@@ -8,6 +8,8 @@ sim_env_url: "https://10doshi12-firewatch-env.hf.space"
 sft:
   # 14B profile tuned for Colab/Kaggle VRAM constraints.
   base_model: "unsloth/Qwen2.5-14B-Instruct-bnb-4bit"
+  # Dense fallback when Unsloth / low-bit CUDA runtime is unavailable.
+  fallback_base_model: "Qwen/Qwen2.5-3B-Instruct"
   max_seq_length: 1536
   lora_rank: 16
   lora_alpha: 16
@@ -29,6 +31,7 @@ sft:
   max_prompt_length: 1024
   max_completion_length: 256
   optimizer: "adamw_8bit"
+  fallback_optimizer: "adamw_torch"
   baseline_sim_episodes: 20
 
 gnn:
@@ -52,4 +55,6 @@ grpo:
   max_grad_norm: 0.1
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.1
+  optimizer: "adamw_8bit"
+  fallback_optimizer: "adamw_torch"
   save_steps: 50

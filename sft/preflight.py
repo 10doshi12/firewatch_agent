@@ -8,7 +8,6 @@ Unsloth availability, CUDA, and disk before `sft.train` loads the base LLM.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import sys
@@ -20,6 +19,7 @@ from huggingface_hub import HfApi
 
 from data_gen.check_batch import check_jsonl_file
 from shared import hf_auth, hf_io
+from shared.model_runtime import get_fallback_base_model, try_import_unsloth
 from shared.platform import WORKING_DIR, verify_disk_space
 from sft.train import detect_current_batch, load_config
 
@@ -74,10 +74,15 @@ def _detect_batch(namespace: str) -> tuple[int | None, list[str]]:
         return None, [f"could not detect current batch: {exc}"]
 
 
-def _check_unsloth() -> list[str]:
-    if importlib.util.find_spec("unsloth") is None:
-        return ["Unsloth is not importable in this runtime"]
-    return []
+def _check_unsloth(config: dict) -> tuple[list[str], list[str]]:
+    FastLanguageModel, error = try_import_unsloth()
+    if FastLanguageModel is not None:
+        return [], []
+
+    return [], [
+        "Unsloth import failed; training will fall back to "
+        f"{get_fallback_base_model(config.get('sft', {}))} ({error})"
+    ]
 
 
 def _check_cuda(require_cuda: bool) -> tuple[list[str], dict[str, str | bool | None]]:
@@ -138,7 +143,9 @@ def run_preflight(
             if not batch_result.ok:
                 errors.extend(batch_result.errors)
 
-    errors.extend(_check_unsloth())
+    unsloth_errors, unsloth_warnings = _check_unsloth(config)
+    errors.extend(unsloth_errors)
+    warnings.extend(unsloth_warnings)
 
     cuda_errors, cuda_details = _check_cuda(require_cuda=require_cuda)
     errors.extend(cuda_errors)

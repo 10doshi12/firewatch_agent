@@ -46,6 +46,10 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from shared import hf_auth, hf_io  # noqa: E402
+from shared.model_runtime import (  # noqa: E402
+    resolve_base_model_for_inference,
+    try_import_unsloth,
+)
 from shared.platform import CHECKPOINTS_DIR, WORKING_DIR  # noqa: E402
 
 from gnn.adjacency import NUM_SERVICES  # noqa: E402
@@ -294,23 +298,25 @@ def _load_models(
     """
     sft_config = config.get("sft", {})
     gnn_config = config.get("gnn", {})
-    base_model_name = sft_config.get("base_model", "unsloth/Qwen2.5-7B-Instruct-bnb-4bit")
     max_seq_length = sft_config.get("max_seq_length", 2048)
+
+    FastLanguageModel, unsloth_error = try_import_unsloth()
+    use_unsloth = FastLanguageModel is not None
+    base_model_name = resolve_base_model_for_inference(
+        sft_config,
+        use_low_bit_runtime=use_unsloth,
+        lora_path=lora_path,
+    )
 
     # --- Load LLM ---
     logger.info("Loading base model: %s", base_model_name)
 
-    use_unsloth = False
-    try:
-        from unsloth import FastLanguageModel
-        use_unsloth = True
+    if use_unsloth:
         logger.info("Using Unsloth for model loading")
-    except ImportError:
-        logger.info("Unsloth not available, using transformers + peft")
+    else:
+        logger.info("Unsloth unavailable (%s), using dense transformers + peft", unsloth_error)
 
     if use_unsloth:
-        from unsloth import FastLanguageModel
-
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=base_model_name,
             max_seq_length=max_seq_length,
@@ -327,26 +333,25 @@ def _load_models(
         # Set to eval/inference mode
         FastLanguageModel.for_inference(model)
     else:
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import PeftModel
 
-        bnb_config = None
+        load_kwargs = {
+            "device_map": {"": 0} if torch.cuda.is_available() else "cpu",
+        }
+        chosen_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         try:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
+            model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                dtype=chosen_dtype,
+                **load_kwargs,
             )
-        except Exception:
-            logger.info("bitsandbytes 4-bit not available, loading in fp16")
-
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model_name,
-            quantization_config=bnb_config,
-            device_map={"": 0} if torch.cuda.is_available() else "cpu",
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        )
+        except TypeError:
+            model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                torch_dtype=chosen_dtype,
+                **load_kwargs,
+            )
         tokenizer = AutoTokenizer.from_pretrained(base_model_name)
 
         if lora_path and lora_path.exists():

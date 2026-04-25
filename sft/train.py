@@ -45,6 +45,11 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from shared import hf_auth, hf_io  # noqa: E402
+from shared.model_runtime import (  # noqa: E402
+    resolve_base_model_for_training,
+    resolve_optimizer_for_runtime,
+    try_import_unsloth,
+)
 from shared.platform import CHECKPOINTS_DIR, PLATFORM, WORKING_DIR, verify_disk_space  # noqa: E402
 
 from gnn.adjacency import NUM_SERVICES  # noqa: E402
@@ -256,7 +261,6 @@ def load_llm_and_train(
         Path to saved LoRA adapter directory.
     """
     sft_config = config.get("sft", {})
-    base_model = sft_config.get("base_model", "unsloth/Qwen2.5-7B-Instruct-bnb-4bit")
     max_seq_length = sft_config.get("max_seq_length", 2048)
     lora_rank = sft_config.get("lora_rank", 16)
     lora_alpha = sft_config.get("lora_alpha", 16)
@@ -273,23 +277,40 @@ def load_llm_and_train(
     warmup_ratio = sft_config.get("warmup_ratio", 0.1)
     max_prompt_length = sft_config.get("max_prompt_length", 1024)
     max_completion_length = sft_config.get("max_completion_length", 256)
-    optimizer_name = sft_config.get("optimizer", "adamw_8bit")
 
     output_dir = CHECKPOINTS_DIR / "sft_llm" / f"batch_{batch_num:03d}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Try Unsloth first, fall back to transformers + peft ---
-    use_unsloth = False
-    try:
-        from unsloth import FastLanguageModel
-        use_unsloth = True
+    # --- Try Unsloth first, fall back to a dense transformers + peft path ---
+    FastLanguageModel, unsloth_error = try_import_unsloth()
+    use_unsloth = FastLanguageModel is not None
+    if use_unsloth:
         print("[train] Using Unsloth for model loading")
-    except ImportError:
-        print("[train] Unsloth not available, using transformers + peft")
+    else:
+        print(f"[train] Unsloth unavailable ({unsloth_error}), using transformers + peft")
+
+    base_model = resolve_base_model_for_training(
+        sft_config,
+        use_low_bit_runtime=use_unsloth,
+        prev_lora_path=prev_lora_path,
+    )
+    optimizer_name = resolve_optimizer_for_runtime(
+        sft_config,
+        use_low_bit_runtime=use_unsloth,
+    )
+    configured_base_model = sft_config.get("base_model", base_model)
+    if base_model != configured_base_model:
+        print(
+            "[train] Falling back from "
+            f"{configured_base_model} to {base_model}"
+        )
+    if optimizer_name != sft_config.get("optimizer", optimizer_name):
+        print(
+            "[train] Falling back from optimizer "
+            f"{sft_config.get('optimizer')} to {optimizer_name}"
+        )
 
     if use_unsloth:
-        from unsloth import FastLanguageModel
-
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=base_model,
             max_seq_length=max_seq_length,
@@ -312,24 +333,12 @@ def load_llm_and_train(
                 use_gradient_checkpointing="unsloth",
             )
     else:
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import LoraConfig, PeftModel, get_peft_model
 
-        # Load with 4-bit quantization if bitsandbytes available
-        bnb_config = None
-        try:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
-        except Exception:
-            print("[train] bitsandbytes 4-bit not available, loading in fp16")
-
-        # transformers >=4.50 deprecated `torch_dtype` in favour of `dtype`; fall back for older builds.
+        # Dense fallback path. We intentionally avoid bitsandbytes here because
+        # this branch is entered precisely when the low-bit runtime is unhealthy.
         load_kwargs = {
-            "quantization_config": bnb_config,
             "device_map": {"": 0} if torch.cuda.is_available() else "cpu",
         }
         chosen_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
@@ -339,17 +348,8 @@ def load_llm_and_train(
             model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=chosen_dtype, **load_kwargs)
         tokenizer = AutoTokenizer.from_pretrained(base_model)
 
-        # NOTE: We deliberately skip peft.prepare_model_for_kbit_training here. That
-        # helper iterates every parameter and casts fp16/bf16 → fp32, which doubles
-        # the memory of (un-quantized) embedding/lm_head/layernorm weights. On a T4
-        # with a 14B 4-bit base, the embedding cast alone OOMs (~2.9 GB delta with
-        # only ~2.3 GB free). The two things that helper does that we actually need:
-        #   1) freeze base params  → already done by get_peft_model
-        #   2) make input embeddings produce gradients so LoRA on q/k/v gets signal
-        # We do (2) directly via enable_input_require_grads(). Embeddings stay fp16;
-        # bnb_4bit_compute_dtype=fp16 means the matmul still happens in fp16, and the
-        # LoRA adapter weights themselves are created in fp32 by peft.
-        if bnb_config is not None and hasattr(model, "enable_input_require_grads"):
+        # Dense fallback still needs input grads so LoRA receives signal.
+        if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
 
         if prev_lora_path and prev_lora_path.exists():
@@ -420,9 +420,8 @@ def load_llm_and_train(
         dataset_text_field="text",
     )
     sftconfig_kwargs.update(trl_sft_sequence_kwargs(max_seq_length))
-    # Gradient checkpointing is required for 14B 4-bit on a 15GB T4 — without it the
-    # backward pass OOMs at batch_size=1, max_seq_length=1536. Unsloth path enables this
-    # internally; here we set it via SFTConfig for the transformers+peft fallback.
+    # Unsloth handles checkpointing internally; the dense fallback relies on HF's
+    # checkpointing to stay inside T4 memory limits.
     if not use_unsloth:
         sftconfig_kwargs["gradient_checkpointing"] = True
         sftconfig_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}

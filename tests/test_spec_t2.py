@@ -500,7 +500,7 @@ class TestSFTPreflight:
         monkeypatch.setattr(preflight, "HfApi", lambda token=None: FakeApi())
         monkeypatch.setattr(preflight, "detect_current_batch", lambda namespace: 0)
         monkeypatch.setattr(preflight.hf_io, "pull_reviewed_batch", lambda batch_num, local_dir: batch_path)
-        monkeypatch.setattr(preflight.importlib.util, "find_spec", lambda name: object() if name == "unsloth" else None)
+        monkeypatch.setattr(preflight, "try_import_unsloth", lambda: (object(), None))
         monkeypatch.setattr(preflight.torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(preflight.torch.cuda, "get_device_name", lambda index=0: "T4")
         monkeypatch.setattr(preflight, "verify_disk_space", lambda threshold_gb=20.0: (True, 42.0))
@@ -576,6 +576,94 @@ class TestSFTPreflight:
         assert result.ok is False
         assert any("example_id" in err for err in result.errors)
 
+    def test_preflight_unsloth_failure_warns_when_fallback_configured(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        from sft import preflight
+
+        self._patch_success_dependencies(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            preflight,
+            "load_config",
+            lambda config_path=None: {
+                "hf_namespace": "testns",
+                "sft": {"fallback_base_model": "Qwen/Qwen2.5-3B-Instruct"},
+            },
+        )
+        monkeypatch.setattr(
+            preflight,
+            "try_import_unsloth",
+            lambda: (None, "ModuleNotFoundError: torchvision"),
+        )
+
+        result = preflight.run_preflight()
+
+        assert result.ok is True
+        assert any("fallback" in warning.lower() for warning in result.warnings)
+
+
+# =====================================================================
+# Model runtime selection tests
+# =====================================================================
+
+
+class TestModelRuntimeSelection:
+    def test_training_falls_back_to_dense_model_and_optimizer(self):
+        from shared.model_runtime import (
+            resolve_base_model_for_training,
+            resolve_optimizer_for_runtime,
+        )
+
+        sft_config = {
+            "base_model": "unsloth/Qwen2.5-14B-Instruct-bnb-4bit",
+            "fallback_base_model": "Qwen/Qwen2.5-3B-Instruct",
+            "optimizer": "adamw_8bit",
+            "fallback_optimizer": "adamw_torch",
+        }
+
+        assert resolve_base_model_for_training(
+            sft_config,
+            use_low_bit_runtime=False,
+            prev_lora_path=None,
+        ) == "Qwen/Qwen2.5-3B-Instruct"
+        assert resolve_optimizer_for_runtime(
+            sft_config,
+            use_low_bit_runtime=False,
+        ) == "adamw_torch"
+
+    def test_training_refuses_low_bit_previous_adapter_without_unsloth(self, tmp_path: Path):
+        from shared.model_runtime import resolve_base_model_for_training
+
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        (adapter_dir / "adapter_config.json").write_text(json.dumps({
+            "base_model_name_or_path": "unsloth/Qwen2.5-14B-Instruct-bnb-4bit",
+        }))
+
+        with pytest.raises(RuntimeError, match="Previous LoRA adapter requires the low-bit base model"):
+            resolve_base_model_for_training(
+                {"fallback_base_model": "Qwen/Qwen2.5-3B-Instruct"},
+                use_low_bit_runtime=False,
+                prev_lora_path=adapter_dir,
+            )
+
+    def test_inference_uses_adapter_recorded_dense_base_model(self, tmp_path: Path):
+        from shared.model_runtime import resolve_base_model_for_inference
+
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        (adapter_dir / "adapter_config.json").write_text(json.dumps({
+            "base_model_name_or_path": "Qwen/Qwen2.5-3B-Instruct",
+        }))
+
+        assert resolve_base_model_for_inference(
+            {"base_model": "unsloth/Qwen2.5-14B-Instruct-bnb-4bit"},
+            use_low_bit_runtime=False,
+            lora_path=adapter_dir,
+        ) == "Qwen/Qwen2.5-3B-Instruct"
+
 
 # =====================================================================
 # TRL / SFTConfig API compatibility
@@ -605,8 +693,12 @@ class TestTrainingNotebooks:
             notebook_path = notebook_dir / filename
             assert notebook_path.exists(), f"missing notebook: {filename}"
             content = notebook_path.read_text()
-            assert "uv run python -m sft.preflight --config config.yaml" in content
-            assert "uv run python -m sft.train --config config.yaml" in content
+            assert ".venv/bin/python -m sft.preflight --config config.yaml" in content
+            assert ".venv/bin/python -m sft.train --config config.yaml" in content
             assert content.index("sft.preflight") < content.index("sft.train")
             assert "unsloth" in content.lower()
-            assert "uv pip install" in content and "unsloth" in content
+            assert "pip install -q virtualenv" in content
+            assert "python -m virtualenv .venv" in content
+            assert ".venv/bin/python -m pip install" in content
+            assert "--no-deps -e ." in content
+            assert "torchvision==0.25.0" in content

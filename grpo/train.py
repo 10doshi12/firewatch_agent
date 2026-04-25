@@ -50,6 +50,11 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from shared import hf_auth, hf_io  # noqa: E402
+from shared.model_runtime import (  # noqa: E402
+    resolve_base_model_for_inference,
+    resolve_optimizer_for_runtime,
+    try_import_unsloth,
+)
 from shared.platform import CHECKPOINTS_DIR, PLATFORM, WORKING_DIR, verify_disk_space  # noqa: E402
 
 from gnn.adjacency import NUM_SERVICES  # noqa: E402
@@ -226,24 +231,26 @@ def load_llm(
     Load base LLM + SFT LoRA, optionally overlay GRPO checkpoint.
 
     Returns:
-        (model, tokenizer)
+        (model, tokenizer, use_low_bit_runtime)
     """
     sft_config = config.get("sft", {})
-    base_model = sft_config.get("base_model", "unsloth/Qwen2.5-7B-Instruct-bnb-4bit")
     max_seq_length = sft_config.get("max_seq_length", 2048)
 
-    # Try Unsloth first, fall back to transformers + PEFT
-    use_unsloth = False
-    try:
-        from unsloth import FastLanguageModel
-        use_unsloth = True
+    FastLanguageModel, unsloth_error = try_import_unsloth()
+    use_unsloth = FastLanguageModel is not None
+    base_model = resolve_base_model_for_inference(
+        sft_config,
+        use_low_bit_runtime=use_unsloth,
+        lora_path=sft_lora_path,
+    )
+
+    # Try Unsloth first, fall back to dense transformers + PEFT
+    if use_unsloth:
         print("[grpo] Using Unsloth for model loading")
-    except ImportError:
-        print("[grpo] Unsloth not available, using transformers + PEFT")
+    else:
+        print(f"[grpo] Unsloth unavailable ({unsloth_error}), using transformers + PEFT")
 
     if use_unsloth:
-        from unsloth import FastLanguageModel
-
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=base_model,
             max_seq_length=max_seq_length,
@@ -274,26 +281,25 @@ def load_llm(
                         "Set FORCE_FRESH_GRPO=1 to start fresh."
                     ) from exc
     else:
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import PeftModel
 
-        bnb_config = None
+        load_kwargs = {
+            "device_map": {"": 0} if torch.cuda.is_available() else "cpu",
+        }
+        chosen_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         try:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
+            model = AutoModelForCausalLM.from_pretrained(
+                base_model,
+                dtype=chosen_dtype,
+                **load_kwargs,
             )
-        except Exception:
-            print("[grpo] bitsandbytes 4-bit not available, loading fp16")
-
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            quantization_config=bnb_config,
-            device_map={"": 0} if torch.cuda.is_available() else "cpu",
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        )
+        except TypeError:
+            model = AutoModelForCausalLM.from_pretrained(
+                base_model,
+                torch_dtype=chosen_dtype,
+                **load_kwargs,
+            )
         tokenizer = AutoTokenizer.from_pretrained(base_model)
 
         # Apply SFT LoRA
@@ -321,7 +327,7 @@ def load_llm(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    return model, tokenizer
+    return model, tokenizer, use_unsloth
 
 
 def load_gnn(
@@ -422,6 +428,7 @@ def create_env_client(config: dict):
 def run_grpo_training(
     model,
     tokenizer,
+    use_low_bit_runtime: bool,
     gnn_model: GraphSAGEModel,
     normalizer: WelfordNormalizer,
     env_client,
@@ -516,6 +523,11 @@ def run_grpo_training(
     # --- Configure GRPOTrainer ---
     from trl import GRPOTrainer, GRPOConfig
 
+    optimizer_name = resolve_optimizer_for_runtime(
+        grpo_config,
+        use_low_bit_runtime=use_low_bit_runtime,
+    )
+
     training_args = GRPOConfig(
         output_dir=str(output_dir),
         num_generations=num_generations,
@@ -528,7 +540,7 @@ def run_grpo_training(
         max_grad_norm=max_grad_norm,
         lr_scheduler_type=lr_scheduler,
         warmup_ratio=warmup_ratio,
-        optim="adamw_8bit",
+        optim=optimizer_name,
         logging_steps=1,
         save_steps=save_steps,
         save_total_limit=3,
@@ -698,7 +710,7 @@ def run_grpo(config_path: Path | None = None) -> None:
 
     # ===== Phase B: Load models =====
     print("\n[grpo] === Phase B: Load models ===")
-    model, tokenizer = load_llm(sft_path, grpo_path, config)
+    model, tokenizer, use_low_bit_runtime = load_llm(sft_path, grpo_path, config)
     gnn_model, normalizer = load_gnn(gnn_path, norm_path, config)
 
     # ===== Phase C: Connect to sim + build dataset =====
@@ -720,6 +732,7 @@ def run_grpo(config_path: Path | None = None) -> None:
     final_dir = run_grpo_training(
         model=model,
         tokenizer=tokenizer,
+        use_low_bit_runtime=use_low_bit_runtime,
         gnn_model=gnn_model,
         normalizer=normalizer,
         env_client=env_client,
