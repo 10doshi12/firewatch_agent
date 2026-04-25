@@ -102,39 +102,58 @@ trivially into `(prompt, gold_action)` for behavioural cloning. This
 is how you bootstrap SFT data from the production agent without
 hand-writing examples.
 
-#### Batch numbering
+#### Batch numbering (data files)
 
-The training data convention is zero-indexed:
+There are **30** generator scripts, each producing **50** examples in one
+`batch_NNN.jsonl` on disk / Hub (`batch_000` … `batch_029`).
 
   * `gen_01_*.py` -> `batch_000.jsonl`
-  * `gen_02_*.py` -> `batch_001.jsonl`
-  * ...
+  * …
   * `gen_30_*.py` -> `batch_029.jsonl`
 
 `data_gen.run_generator` accepts either `--script 01` or `--batch 0`
 and prints the resolved mapping before writing the raw batch. Existing
 raw files are never overwritten.
 
+#### SFT campaign: `paired_15` (default in `config.yaml`)
+
+With `sft.campaign: paired_15`, **15** Hub training runs are used (indices **0–14**).
+Each run consumes **two** reviewed data files: run `k` uses `batch_{2k}` and
+`batch_{2k+1}`. Artifacts are stored as `firewatch-agent-sft/batch_k/` and
+`firewatch-gnn/gnn/batch_k.pt`. Training is **incremental**: run `k>0` always
+loads GNN + LoRA from run `k-1` on Hub, then writes run `k`.
+
+Use `sft.campaign: legacy_30` for the older “one data file per training step”
+layout (30 steps, indices 0–29).
+
+**Unsloth is required** for SFT, GRPO, and `eval.baseline` model loading:
+`pip install unsloth` (or your Colab/git install) in a **CUDA** environment.
+There is no dense-model fallback; `sft.preflight` **fails** if Unsloth cannot import.
+
+Env vars for long sessions: `MAX_SFT_STEPS` (how many steps per process),
+`SKIP_AUTO_BASELINE=1` to skip post-SFT eval for speed,
+`SFT_APPLY_REGRESSION_OVERRIDE=1` to apply `sft_regression_override.yaml` LR hint
+after a regression from `eval.regression_guard`.
+
 #### Where to run training
 
 Use your local machine for data generation, compliance checks, human
 review, upload, and offline tests. These steps do not require a GPU.
 
-Use Kaggle when the free T4 runtime is enough and `HF_TOKEN` is stored in
-Kaggle Secrets. Use Colab when A100/T4 availability or interactive
-debugging is better. The notebooks in `notebooks/` are thin launchers:
-they clone the repo, create a fresh `.venv` with `python -m virtualenv`, then
-install Unsloth plus a pinned `torchvision` first with plain `pip`. After that they install the
-project in editable mode with `--no-deps` and add only the small set of
-remaining packages that Unsloth does not already provide. This avoids
-mixing the repo lockfile's CUDA-13 Torch stack with Unsloth's CUDA-12
-stack on hosted T4 runtimes. Load `HF_TOKEN`, run `sft.preflight`, then
-`sft.train`.
+Run **GPU** SFT on Colab, Kaggle, or a **Hugging Face GPU Space** / other cloud GPU.
+The monorepo should include both `firewatch_env/` (sim) and `firewatch_agent/`;
+point `sim_env_url` at `http://127.0.0.1:8000` when the env server runs on the
+same host. Install Unsloth first (see upstream docs), then `uv sync` / `pip install -e .`
+under `firewatch_agent/`, set `HF_TOKEN`, run `sft.preflight`, then `sft.train`.
 
 Before any real SFT run, `sft.preflight` checks HF auth, required Hub
-repos, reviewed batch discovery, batch compliance, Unsloth import, CUDA,
-and disk space. If Unsloth is unavailable but `fallback_base_model` is
-configured, preflight warns and the trainer falls back to the dense model.
+repos, reviewed batch discovery, batch compliance, **Unsloth import (hard
+requirement)**, CUDA, and disk space.
+
+Optional: build a GPU image from the monorepo root with
+`docker build -f docker/hf-train-sft.Dockerfile -t firewatch-sft .` (see
+`docker/hf-train-sft.Dockerfile`), then override `CMD` to start `firewatch_env`
+and run `sft.train`.
 
 #### Hugging Face artifact layout
 
@@ -144,8 +163,8 @@ Canonical durable state lives in Hugging Face Hub repos:
     * `reviewed/batch_NNN.jsonl`
     * optional `baselines/metrics.jsonl`
   * SFT model repo: `<namespace>/firewatch-agent-sft`
-    * `batch_NNN/` LoRA adapter files
-    * `latest/` only after final SFT batch
+    * `batch_NNN/` LoRA adapter files: `000`–`014` for `paired_15`, or `000`–`029` for `legacy_30`
+    * `latest/` after the final SFT run (`batch_014` in `paired_15`, or `batch_029` in `legacy_30`)
   * GNN model repo: `<namespace>/firewatch-gnn`
     * `gnn/batch_NNN.pt`
     * `gnn/normalization.json`

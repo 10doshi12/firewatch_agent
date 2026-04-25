@@ -48,10 +48,22 @@ def draw_substitution_set(rng: random.Random) -> dict[str, str]:
 
 
 def apply_substitution(text: str, sub_map: dict[str, str]) -> str:
-    """Apply substitution map to service names in text."""
-    for canonical, sub in sub_map.items():
+    """Apply substitution map to service names in text.
+
+    Longer canonical service names are replaced first. The substring ``cache`` as a
+    *service* must not transform ``increase_cache_memory`` into ``increase_kv-cache_memory``,
+    so that action name is protected while ``(cache)`` arguments are still substituted.
+    """
+    protected: list[str] = []
+    token = "increase_cache_memory"
+    if token in text:
+        parts = text.split(token)
+        if len(parts) > 1:
+            text = "\x00INCR_CACHE_MEM\x00".join(parts)
+    # Longer keys first so e.g. auth-service before service if both existed
+    for canonical, sub in sorted(sub_map.items(), key=lambda kv: -len(kv[0])):
         text = text.replace(canonical, sub)
-    return text
+    return text.replace("\x00INCR_CACHE_MEM\x00", token)
 
 
 def _derive_status(error_rate: float, memory_util: float | None = None) -> str:

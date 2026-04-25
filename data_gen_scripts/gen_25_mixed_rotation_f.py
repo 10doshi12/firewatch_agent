@@ -34,7 +34,11 @@ GOLD = {
     "task_easy_log_storm_disk": ["fetch_logs(notification-service)", "set_log_level(notification-service, level=\"INFO\")", "declare_resolved"],
     "task_easy_cronjob_spike": ["get_metrics_detail(analytics-service)", "fetch_logs(analytics-service)", "scale_replicas(analytics-service)", "declare_resolved"],
     "task_easy_rollout_stuck": ["fetch_logs(checkout-service)", "rollback_deployment_rollout(checkout-service)", "declare_resolved"],
-    "task_easy_noisy_neighbor": ["get_metrics_detail()", "evict_noisy_pod()", "declare_resolved"],
+    "task_easy_noisy_neighbor": [
+        "get_metrics_detail(batch-processor)",
+        "evict_noisy_pod(batch-processor)",
+        "declare_resolved",
+    ],
     "task_easy_alert_fatigue": ["get_metrics_detail(db-proxy)", "fetch_logs(db-proxy)", "revert_config(db-proxy)", "declare_resolved"],
     "task_medium_hpa_cold_start": ["fetch_logs(recommendation-engine)", "get_metrics_detail(recommendation-engine)", "pre_warm_service(recommendation-engine)", "declare_resolved"],
     "task_medium_stale_registry": ["get_metrics_detail(recommendation-engine)", "deregister_stale_instances(recommendation-engine)", "declare_resolved"],

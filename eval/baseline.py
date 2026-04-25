@@ -301,62 +301,34 @@ def _load_models(
     max_seq_length = sft_config.get("max_seq_length", 2048)
 
     FastLanguageModel, unsloth_error = try_import_unsloth()
-    use_unsloth = FastLanguageModel is not None
+    if FastLanguageModel is None:
+        raise RuntimeError(
+            f"Unsloth is required for baseline eval but failed to import: {unsloth_error}. "
+            "No dense/PyTorch fallback is supported."
+        )
     base_model_name = resolve_base_model_for_inference(
         sft_config,
-        use_low_bit_runtime=use_unsloth,
+        use_low_bit_runtime=True,
         lora_path=lora_path,
     )
 
     # --- Load LLM ---
     logger.info("Loading base model: %s", base_model_name)
+    logger.info("Using Unsloth for model loading")
 
-    if use_unsloth:
-        logger.info("Using Unsloth for model loading")
-    else:
-        logger.info("Unsloth unavailable (%s), using dense transformers + peft", unsloth_error)
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=base_model_name,
+        max_seq_length=max_seq_length,
+        dtype=None,
+        load_in_4bit=True,
+    )
 
-    if use_unsloth:
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=base_model_name,
-            max_seq_length=max_seq_length,
-            dtype=None,
-            load_in_4bit=True,
-        )
-
-        # Apply LoRA adapter if available
-        if lora_path and lora_path.exists():
-            from peft import PeftModel
-            model = PeftModel.from_pretrained(model, str(lora_path))
-            logger.info("Loaded LoRA adapter from %s", lora_path)
-
-        # Set to eval/inference mode
-        FastLanguageModel.for_inference(model)
-    else:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+    if lora_path and lora_path.exists():
         from peft import PeftModel
+        model = PeftModel.from_pretrained(model, str(lora_path))
+        logger.info("Loaded LoRA adapter from %s", lora_path)
 
-        load_kwargs = {
-            "device_map": {"": 0} if torch.cuda.is_available() else "cpu",
-        }
-        chosen_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                base_model_name,
-                dtype=chosen_dtype,
-                **load_kwargs,
-            )
-        except TypeError:
-            model = AutoModelForCausalLM.from_pretrained(
-                base_model_name,
-                torch_dtype=chosen_dtype,
-                **load_kwargs,
-            )
-        tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-
-        if lora_path and lora_path.exists():
-            model = PeftModel.from_pretrained(model, str(lora_path))
-            logger.info("Loaded LoRA adapter from %s", lora_path)
+    FastLanguageModel.for_inference(model)
 
     # Ensure pad token
     if tokenizer.pad_token is None:

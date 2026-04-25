@@ -65,7 +65,12 @@ GOLD = {
     "task_medium_grpc_deadline": ["get_metrics_detail(payment-service)", "trace_dependencies(order-service)", "enable_deadline_propagation(order-service)", "declare_resolved"],
     "task_hard_config_drift_noise": ["get_metrics_detail(api-gateway)", "fetch_logs(api-gateway)", "revert_config(api-gateway)", "declare_resolved"],
     "task_hard_quota_cascade": ["inspect_quota_usage(ml-inference-service)", "request_quota_increase(ml-inference-service, resource=\"gpu_compute\")", "declare_resolved"],
-    "task_hard_partial_infra_asymmetric": ["inspect_infrastructure_topology()", "get_metrics_detail(infrastructure)", "remediate_infrastructure()", "declare_resolved"],
+    "task_hard_partial_infra_asymmetric": [
+        "inspect_infrastructure_topology(db-proxy)",
+        "get_metrics_detail(db-proxy)",
+        "remediate_infrastructure(db-proxy)",
+        "declare_resolved",
+    ],
 }
 
 

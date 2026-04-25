@@ -281,11 +281,7 @@ def generate(tasks: list[dict], rng_seed: int) -> list[dict]:
             },
             "gold_action_sequence": gold,
             "gold_alternatives": [],
-            "expected_score_range": {
-                "perfect": 1.0,
-                "acceptable": 0.75,
-                "minimum": 0.50,
-            },
+            "expected_score_range": {"min": 0.50, "max": 1.0},
             "suboptimal_paths": [],
         })
 

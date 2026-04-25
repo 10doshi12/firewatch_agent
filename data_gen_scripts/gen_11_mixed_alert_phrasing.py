@@ -77,7 +77,11 @@ def generate(tasks: list[dict], rng_seed: int) -> list[dict]:
         "task_easy_fail_slow_memleak": ["get_metrics_detail(payment-service)", "scale_replicas(payment-service)", "declare_resolved"],
         "task_easy_liveness_probe_flap": ["get_metrics_detail(payment-processor)", "fetch_logs(payment-processor)", "adjust_probe_timing(payment-processor)", "declare_resolved"],
         "task_easy_cronjob_spike": ["get_metrics_detail(analytics-service)", "fetch_logs(analytics-service)", "scale_replicas(analytics-service)", "declare_resolved"],
-        "task_easy_noisy_neighbor": ["get_metrics_detail()", "evict_noisy_pod()", "declare_resolved"],
+        "task_easy_noisy_neighbor": [
+            "get_metrics_detail(batch-processor)",
+            "evict_noisy_pod(batch-processor)",
+            "declare_resolved",
+        ],
         "task_medium_cascade_memleak": ["trace_dependencies(checkout-service)", "get_metrics_detail(payment-service)", "scale_replicas(payment-service)", "declare_resolved"],
         "task_medium_replica_lag": ["fetch_logs(user-service)", "get_metrics_detail(user-service)", "redirect_reads_to_primary(user-service)", "force_replica_resync(user-service)", "declare_resolved"],
         "task_medium_mtls_rotation": ["inspect_mtls_status(payment-service)", "force_cert_rotation(payment-service)", "declare_resolved"],

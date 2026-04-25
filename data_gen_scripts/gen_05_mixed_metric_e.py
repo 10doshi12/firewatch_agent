@@ -128,8 +128,8 @@ def _generate_easy_examples(
             "declare_resolved",
         ],
         "task_easy_noisy_neighbor": [
-            "get_metrics_detail()",
-            "evict_noisy_pod()",
+            "get_metrics_detail(batch-processor)",
+            "evict_noisy_pod(batch-processor)",
             "declare_resolved",
         ],
     }

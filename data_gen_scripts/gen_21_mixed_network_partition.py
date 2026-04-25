@@ -42,7 +42,12 @@ GOLD = {
     "task_medium_mtls_rotation": ["inspect_mtls_status(payment-service)", "force_cert_rotation(payment-service)", "declare_resolved"],
     "task_hard_gray_failure": ["get_metrics_detail(auth-service)", "fetch_logs(auth-service)", "inspect_network_policy(auth-service)", "revert_network_policy(auth-service)", "declare_resolved"],
     "task_hard_redis_split_brain": ["inspect_cluster_topology(redis-cluster)", "flush_diverged_keys(redis-cluster)", "force_cluster_resync(redis-cluster)", "declare_resolved"],
-    "task_hard_partial_infra_asymmetric": ["inspect_infrastructure_topology()", "get_metrics_detail(infrastructure)", "remediate_infrastructure()", "declare_resolved"],
+    "task_hard_partial_infra_asymmetric": [
+        "inspect_infrastructure_topology(db-proxy)",
+        "get_metrics_detail(db-proxy)",
+        "remediate_infrastructure(db-proxy)",
+        "declare_resolved",
+    ],
 }
 
 

@@ -2,7 +2,7 @@
 preflight.py — cheap readiness checks before real SFT GPU training.
 
 This module verifies auth, Hub repo layout, reviewed data compliance,
-Unsloth availability, CUDA, and disk before `sft.train` loads the base LLM.
+**Unsloth** (required — no dense fallback), CUDA, and disk before `sft.train`.
 """
 
 from __future__ import annotations
@@ -19,8 +19,9 @@ from huggingface_hub import HfApi
 
 from data_gen.check_batch import check_jsonl_file
 from shared import hf_auth, hf_io
-from shared.model_runtime import get_fallback_base_model, try_import_unsloth
+from shared import model_runtime
 from shared.platform import WORKING_DIR, verify_disk_space
+from sft.campaign import data_batches_for_run
 from sft.train import detect_current_batch, load_config
 
 
@@ -65,24 +66,29 @@ def _check_repos(api: HfApi, namespace: str) -> tuple[list[str], list[str]]:
     return errors, warnings
 
 
-def _detect_batch(namespace: str) -> tuple[int | None, list[str]]:
+def _detect_batch(namespace: str, config: dict) -> tuple[int | None, list[str]]:
     try:
-        return detect_current_batch(namespace), []
+        campaign = (config.get("sft") or {}).get("campaign", "paired_15")
+        return detect_current_batch(namespace, campaign), []
     except SystemExit as exc:
         return None, [f"could not detect current batch: exited with {exc.code}"]
     except Exception as exc:
         return None, [f"could not detect current batch: {exc}"]
 
 
-def _check_unsloth(config: dict) -> tuple[list[str], list[str]]:
-    FastLanguageModel, error = try_import_unsloth()
+def _check_unsloth(_config: dict) -> tuple[list[str], list[str]]:
+    # Resolve via `model_runtime` so tests can patch `model_runtime.try_import_unsloth`.
+    FastLanguageModel, error = model_runtime.try_import_unsloth()
     if FastLanguageModel is not None:
         return [], []
 
-    return [], [
-        "Unsloth import failed; training will fall back to "
-        f"{get_fallback_base_model(config.get('sft', {}))} ({error})"
-    ]
+    err = error or "unknown import error"
+    return [
+        "Unsloth is required for SFT training but failed to import. "
+        f"Install the `unsloth` package in a GPU environment (e.g. `pip install unsloth` "
+        f"or the Colab wheel). No dense/PyTorch fallback is supported. "
+        f"Details: {err}"
+    ], []
 
 
 def _check_cuda(require_cuda: bool) -> tuple[list[str], dict[str, str | bool | None]]:
@@ -125,23 +131,39 @@ def run_preflight(
     errors.extend(repo_errors)
     warnings.extend(repo_warnings)
 
-    detected_batch, batch_errors = _detect_batch(namespace)
+    campaign = (config.get("sft") or {}).get("campaign", "paired_15")
+    details["sft_campaign"] = campaign
+    detected_batch, batch_errors = _detect_batch(namespace, config)
     batch_num = detected_batch
     errors.extend(batch_errors)
 
     if batch_num is not None:
         local_dir = WORKING_DIR / "sft_preflight"
         local_dir.mkdir(parents=True, exist_ok=True)
+        paired = str(campaign).lower() in ("paired_15", "paired", "15")
         try:
-            batch_path = hf_io.pull_reviewed_batch(batch_num, local_dir)
+            if paired:
+                a, b = data_batches_for_run(batch_num)
+                path_a = hf_io.pull_reviewed_batch(a, local_dir)
+                path_b = hf_io.pull_reviewed_batch(b, local_dir)
+                total = 0
+                for p in (path_a, path_b):
+                    br = check_jsonl_file(p, expected_count=50)
+                    total += br.example_count
+                    if not br.ok:
+                        errors.extend([f"{p.name}: {e}" for e in br.errors])
+                details["reviewed_data_batches"] = f"{a:03d}+{b:03d}"
+                details["reviewed_batch_paths"] = [str(path_a), str(path_b)]
+                details["reviewed_example_count"] = total
+            else:
+                batch_path = hf_io.pull_reviewed_batch(batch_num, local_dir)
+                batch_result = check_jsonl_file(batch_path, expected_count=50)
+                details["reviewed_batch_path"] = str(batch_path)
+                details["reviewed_example_count"] = batch_result.example_count
+                if not batch_result.ok:
+                    errors.extend(batch_result.errors)
         except Exception as exc:
-            errors.append(f"could not pull reviewed batch {batch_num:03d}: {exc}")
-        else:
-            batch_result = check_jsonl_file(batch_path, expected_count=50)
-            details["reviewed_batch_path"] = str(batch_path)
-            details["reviewed_example_count"] = batch_result.example_count
-            if not batch_result.ok:
-                errors.extend(batch_result.errors)
+            errors.append(f"could not pull reviewed data for next step {batch_num}: {exc}")
 
     unsloth_errors, unsloth_warnings = _check_unsloth(config)
     errors.extend(unsloth_errors)

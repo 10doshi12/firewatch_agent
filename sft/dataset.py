@@ -55,10 +55,10 @@ def load_batch(jsonl_path: Path) -> list[dict]:
                 f"in {jsonl_path}:\n" + "\n".join(errors)
             )
 
-    if len(examples) != 50:
+    if len(examples) not in (50, 100):
         print(
-            f"[dataset] WARNING: Expected 50 examples in {jsonl_path}, "
-            f"got {len(examples)}. Proceeding with {len(examples)}."
+            f"[dataset] WARNING: Expected 50 (one data file) or 100 (two merged) "
+            f"examples in {jsonl_path}, got {len(examples)}. Proceeding."
         )
 
     return examples

@@ -2,7 +2,8 @@
 review.py — Phase B: Human Review CLI
 
 Walks the human through a raw batch, accept/reject/edit each example.
-Usage: python -m firewatch_agent.data_gen.review --batch 6
+Usage: python -m data_gen.review --batch 6
+       python -m data_gen.review --batch 6 --auto-accept  # copy raw->reviewed if checks pass
 """
 
 import argparse
@@ -256,12 +257,49 @@ def run_review(batch_num: int) -> None:
             f.write(json.dumps(example) + "\n")
 
     print(f"\nReviewed batch written: {reviewed_file.name}")
-    print("Next step: python -m firewatch_agent.data_gen.upload --batch {batch_num}")
+    print(f"Next step: python -m data_gen.upload --batch {batch_num}")
+
+
+def auto_accept_batch(batch_num: int) -> None:
+    """
+    Run strict ``check_batch`` compliance on the raw JSONL; if it passes, write the
+    same 50 lines to ``reviewed/`` (all accepted). Use for CI or non-interactive Hub sync.
+    """
+    from data_gen.check_batch import check_examples
+
+    raw_file = RAW_DIR / f"batch_{batch_num:03d}.jsonl"
+    if not raw_file.exists():
+        print(f"ERROR: raw batch not found: {raw_file}")
+        print(f"Run: python -m data_gen.run_generator --batch {batch_num}")
+        sys.exit(1)
+
+    with open(raw_file) as f:
+        examples = [json.loads(line) for line in f if line.strip()]
+
+    result = check_examples(examples, expected_count=50)
+    if not result.ok:
+        print(f"ERROR: strict check failed for batch {batch_num:03d} ({len(result.errors)} errors)")
+        for err in result.errors[:40]:
+            print(f"  {err}")
+        if len(result.errors) > 40:
+            print(f"  ... and {len(result.errors) - 40} more")
+        sys.exit(1)
+
+    reviewed_file = REVIEWED_DIR / f"batch_{batch_num:03d}.jsonl"
+    with open(reviewed_file, "w") as f:
+        for ex in examples:
+            f.write(json.dumps(ex) + "\n")
+    print(f"OK: auto-accepted {len(examples)} examples -> {reviewed_file.name}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Review a raw batch of training examples")
     parser.add_argument("--batch", required=True, type=int, help="Batch number (0-29)")
+    parser.add_argument(
+        "--auto-accept",
+        action="store_true",
+        help="Non-interactive: validate raw with check_batch, then copy to reviewed/",
+    )
     args = parser.parse_args()
 
     batch_num = args.batch
@@ -269,7 +307,10 @@ def main():
         print(f"ERROR: batch number must be 0-29, got: {args.batch}")
         sys.exit(1)
 
-    run_review(batch_num)
+    if args.auto_accept:
+        auto_accept_batch(batch_num)
+    else:
+        run_review(batch_num)
 
 
 if __name__ == "__main__":

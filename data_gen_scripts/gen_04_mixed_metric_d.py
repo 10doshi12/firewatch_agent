@@ -612,9 +612,9 @@ def _generate_hard_examples(
             "declare_resolved",
         ],
         "task_hard_partial_infra_asymmetric": [
-            "inspect_infrastructure_topology()",
-            "get_metrics_detail(infrastructure)",
-            "remediate_infrastructure()",
+            "inspect_infrastructure_topology(db-proxy)",
+            "get_metrics_detail(db-proxy)",
+            "remediate_infrastructure(db-proxy)",
             "declare_resolved",
         ],
         "task_hard_multiteam_dual_fault": [

@@ -237,97 +237,51 @@ def load_llm(
     max_seq_length = sft_config.get("max_seq_length", 2048)
 
     FastLanguageModel, unsloth_error = try_import_unsloth()
-    use_unsloth = FastLanguageModel is not None
+    if FastLanguageModel is None:
+        raise RuntimeError(
+            f"[grpo] Unsloth is required but failed to import: {unsloth_error}. "
+            "No dense/PyTorch fallback is supported."
+        )
     base_model = resolve_base_model_for_inference(
         sft_config,
-        use_low_bit_runtime=use_unsloth,
+        use_low_bit_runtime=True,
         lora_path=sft_lora_path,
     )
 
-    # Try Unsloth first, fall back to dense transformers + PEFT
-    if use_unsloth:
-        print("[grpo] Using Unsloth for model loading")
-    else:
-        print(f"[grpo] Unsloth unavailable ({unsloth_error}), using transformers + PEFT")
+    print("[grpo] Using Unsloth for model loading")
 
-    if use_unsloth:
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=base_model,
-            max_seq_length=max_seq_length,
-            dtype=None,
-            load_in_4bit=True,
-            device_map={"": 0},
-        )
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=base_model,
+        max_seq_length=max_seq_length,
+        dtype=None,
+        load_in_4bit=True,
+        device_map={"": 0},
+    )
 
-        # Apply SFT LoRA
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, str(sft_lora_path))
-        print(f"[grpo] Applied SFT LoRA from {sft_lora_path}")
+    from peft import PeftModel
+    model = PeftModel.from_pretrained(model, str(sft_lora_path))
+    print(f"[grpo] Applied SFT LoRA from {sft_lora_path}")
 
-        # Overlay GRPO checkpoint if resuming
-        if grpo_checkpoint_path and grpo_checkpoint_path.exists():
-            try:
-                model = PeftModel.from_pretrained(
-                    model.base_model.model, str(grpo_checkpoint_path)
-                )
-                print(f"[grpo] Overlaid GRPO checkpoint from {grpo_checkpoint_path}")
-            except Exception as exc:
-                force_fresh = os.environ.get("FORCE_FRESH_GRPO", "0") == "1"
-                if force_fresh:
-                    print(f"[grpo] WARNING: GRPO checkpoint load failed ({exc}), starting fresh")
-                else:
-                    raise RuntimeError(
-                        f"[grpo] GRPO checkpoint load failed: {exc}. "
-                        "Set FORCE_FRESH_GRPO=1 to start fresh."
-                    ) from exc
-    else:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from peft import PeftModel
-
-        load_kwargs = {
-            "device_map": {"": 0} if torch.cuda.is_available() else "cpu",
-        }
-        chosen_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    if grpo_checkpoint_path and grpo_checkpoint_path.exists():
         try:
-            model = AutoModelForCausalLM.from_pretrained(
-                base_model,
-                dtype=chosen_dtype,
-                **load_kwargs,
+            model = PeftModel.from_pretrained(
+                model.base_model.model, str(grpo_checkpoint_path)
             )
-        except TypeError:
-            model = AutoModelForCausalLM.from_pretrained(
-                base_model,
-                torch_dtype=chosen_dtype,
-                **load_kwargs,
-            )
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
+            print(f"[grpo] Overlaid GRPO checkpoint from {grpo_checkpoint_path}")
+        except Exception as exc:
+            force_fresh = os.environ.get("FORCE_FRESH_GRPO", "0") == "1"
+            if force_fresh:
+                print(f"[grpo] WARNING: GRPO checkpoint load failed ({exc}), starting fresh")
+            else:
+                raise RuntimeError(
+                    f"[grpo] GRPO checkpoint load failed: {exc}. "
+                    "Set FORCE_FRESH_GRPO=1 to start fresh."
+                ) from exc
 
-        # Apply SFT LoRA
-        model = PeftModel.from_pretrained(model, str(sft_lora_path))
-        print(f"[grpo] Applied SFT LoRA from {sft_lora_path}")
-
-        # Overlay GRPO checkpoint if resuming
-        if grpo_checkpoint_path and grpo_checkpoint_path.exists():
-            try:
-                model = PeftModel.from_pretrained(
-                    model.base_model.model, str(grpo_checkpoint_path)
-                )
-                print(f"[grpo] Overlaid GRPO checkpoint from {grpo_checkpoint_path}")
-            except Exception as exc:
-                force_fresh = os.environ.get("FORCE_FRESH_GRPO", "0") == "1"
-                if force_fresh:
-                    print(f"[grpo] WARNING: GRPO checkpoint load failed ({exc}), starting fresh")
-                else:
-                    raise RuntimeError(
-                        f"[grpo] GRPO checkpoint load failed: {exc}. "
-                        "Set FORCE_FRESH_GRPO=1 to start fresh."
-                    ) from exc
-
-    # Ensure pad token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    return model, tokenizer, use_unsloth
+    return model, tokenizer, True
 
 
 def load_gnn(

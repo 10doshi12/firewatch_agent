@@ -50,7 +50,11 @@ GOLD = {
     "task_easy_thread_deadlock": ["thread_dump(order-service)", "restart_thread_pool(order-service)", "declare_resolved"],
     "task_easy_log_debug_disk": ["fetch_logs(api-gateway)", "set_log_level(api-gateway, level=\"INFO\")", "declare_resolved"],
     "task_easy_rollout_stuck": ["fetch_logs(checkout-service)", "rollback_deployment_rollout(checkout-service)", "declare_resolved"],
-    "task_easy_noisy_neighbor": ["get_metrics_detail()", "evict_noisy_pod()", "declare_resolved"],
+    "task_easy_noisy_neighbor": [
+        "get_metrics_detail(batch-processor)",
+        "evict_noisy_pod(batch-processor)",
+        "declare_resolved",
+    ],
     "task_medium_corrupted_external_dep": ["fetch_logs(user-service)", "rollback_deploy(user-service)", "declare_resolved"],
     "task_medium_db_connection_herd": ["fetch_logs(db-proxy)", "stagger_connection_pool_reconnect(db-proxy)", "declare_resolved"],
     "task_medium_config_race": ["get_metrics_detail(api-gateway)", "trace_dependencies(api-gateway)", "revert_config(api-gateway)", "declare_resolved"],

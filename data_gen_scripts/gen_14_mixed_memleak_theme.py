@@ -50,7 +50,11 @@ GOLD = {
     "task_easy_fail_slow_memleak": ["get_metrics_detail(payment-service)", "scale_replicas(payment-service)", "declare_resolved"],
     "task_easy_oom_baseline": ["fetch_logs(auth-service)", "scale_replicas(auth-service)", "declare_resolved"],
     "task_easy_thread_deadlock": ["thread_dump(order-service)", "restart_thread_pool(order-service)", "declare_resolved"],
-    "task_easy_noisy_neighbor": ["get_metrics_detail()", "evict_noisy_pod()", "declare_resolved"],
+    "task_easy_noisy_neighbor": [
+        "get_metrics_detail(batch-processor)",
+        "evict_noisy_pod(batch-processor)",
+        "declare_resolved",
+    ],
     "task_easy_alert_fatigue": ["get_metrics_detail(db-proxy)", "fetch_logs(db-proxy)", "revert_config(db-proxy)", "declare_resolved"],
     "task_medium_cascade_memleak": ["trace_dependencies(checkout-service)", "get_metrics_detail(payment-service)", "scale_replicas(payment-service)", "declare_resolved"],
     "task_medium_circuit_breaker_masking": ["trace_dependencies(product-catalog-service)", "get_metrics_detail(pricing-service)", "scale_replicas(pricing-service)", "declare_resolved"],

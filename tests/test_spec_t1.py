@@ -349,6 +349,38 @@ class TestBatchCompliance:
         assert any("action name" in err for err in result.errors)
 
 
+class TestVerifyReplay:
+    def test_gold_dict_to_env_action_maps_params(self):
+        from data_gen.verify_replay import candidate_service_names, gold_dict_to_env_action
+
+        ex = TestValidate()._make_valid_example()
+        cands = candidate_service_names(ex)
+        assert "auth-service" in cands
+        act = gold_dict_to_env_action(ex["gold_action_sequence"][0], cands)
+        assert act == {
+            "action_type": "fetch_logs",
+            "target_service": "auth-service",
+            "parameters": {"service": "auth-service"},
+        }
+
+    def test_gold_dict_meta_no_target(self):
+        from data_gen.verify_replay import gold_dict_to_env_action
+
+        env = gold_dict_to_env_action(
+            {"action": "declare_resolved", "params": {}},
+            [],
+        )
+        assert env == {"action_type": "declare_resolved", "target_service": None, "parameters": {}}
+
+    def test_static_verify_flags_bad_sequence(self):
+        from data_gen.verify_replay import static_verify_examples
+
+        ex = TestValidate()._make_valid_example()
+        ex["gold_action_sequence"] = [{"params": {"service": "x"}}]
+        errs = static_verify_examples([ex])
+        assert errs
+
+
 class TestDataUpload:
     def test_upload_batch_uses_shared_import_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         from data_gen import upload

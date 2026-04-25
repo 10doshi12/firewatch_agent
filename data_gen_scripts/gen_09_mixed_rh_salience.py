@@ -176,7 +176,11 @@ GOLD_ACTIONS = {
     "task_easy_jwt_clock_skew": ["fetch_logs(auth-service)", "force_ntp_sync(auth-service)", "declare_resolved"],
     "task_easy_rbac_403": ["fetch_logs(notification-service)", "grant_rbac_permission(notification-service)", "declare_resolved"],
     "task_easy_cronjob_spike": ["get_metrics_detail(analytics-service)", "scale_replicas(analytics-service)", "declare_resolved"],
-    "task_easy_noisy_neighbor": ["get_metrics_detail()", "evict_noisy_pod()", "declare_resolved"],
+    "task_easy_noisy_neighbor": [
+        "get_metrics_detail(batch-processor)",
+        "evict_noisy_pod(batch-processor)",
+        "declare_resolved",
+    ],
     "task_medium_canary_false_alert": ["get_metrics_detail(api-gateway)", "fetch_logs(api-gateway)", "declare_resolved"],
     "task_medium_replica_lag": ["fetch_logs(user-service)", "redirect_reads_to_primary(user-service)", "force_replica_resync(user-service)", "declare_resolved"],
     "task_medium_mtls_rotation": ["inspect_mtls_status(payment-service)", "force_cert_rotation(payment-service)", "declare_resolved"],

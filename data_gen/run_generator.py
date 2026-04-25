@@ -236,7 +236,7 @@ def main():
             f.write(json.dumps(example) + "\n")
 
     print(f"Raw batch written: {raw_file.name} ({len(examples)} examples)")
-    print("\nNext step: python -m firewatch_agent.data_gen.review --batch {batch_num}")
+    print(f"\nNext step: python -m data_gen.review --batch {batch_num}")
 
 
 if __name__ == "__main__":

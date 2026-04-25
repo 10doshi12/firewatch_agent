@@ -57,7 +57,11 @@ GOLD = {
     "task_easy_fail_slow_memleak": ["get_metrics_detail(payment-service)", "scale_replicas(payment-service)", "declare_resolved"],
     "task_easy_lb_hotspot": ["get_metrics_detail(user-profile-service)", "rebalance_load(user-profile-service)", "declare_resolved"],
     "task_easy_rate_limiter_misconfig": ["fetch_logs(api-gateway)", "revert_config(api-gateway)", "declare_resolved"],
-    "task_easy_noisy_neighbor": ["get_metrics_detail()", "evict_noisy_pod()", "declare_resolved"],
+    "task_easy_noisy_neighbor": [
+        "get_metrics_detail(batch-processor)",
+        "evict_noisy_pod(batch-processor)",
+        "declare_resolved",
+    ],
     "task_medium_config_race": ["get_metrics_detail(api-gateway)", "trace_dependencies(api-gateway)", "revert_config(api-gateway)", "declare_resolved"],
     "task_medium_replica_lag": ["fetch_logs(user-service)", "get_metrics_detail(user-service)", "redirect_reads_to_primary(user-service)", "force_replica_resync(user-service)", "declare_resolved"],
     "task_medium_db_connection_herd": ["fetch_logs(db-proxy)", "stagger_connection_pool_reconnect(db-proxy)", "declare_resolved"],

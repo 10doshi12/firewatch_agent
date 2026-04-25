@@ -3,12 +3,20 @@
 # Repo IDs are constructed at call time: <hf_namespace>/<repo-role-suffix>
 
 hf_namespace: null  # falls back to HF_NAMESPACE env var or authenticated HF username
+# Baseline / GRPO: use local env on training host, e.g. "http://127.0.0.1:8000"
 sim_env_url: "https://10doshi12-firewatch-env.hf.space"
 
 sft:
+  # Unsloth is mandatory for SFT (4-bit + LoRA). Preflight and training raise if import fails.
+  # paired_15: 15 Hub training ids (0..14), each step uses 2 data files; weights are
+  # always incremental (each run continues LoRA+GNN from the previous Hub save).
+  # legacy_30: 30 one-file steps, same incremental rule per data batch 0..29.
+  campaign: paired_15
+  # Optional: set >1 with MAX_SFT_STEPS env to train multiple steps per process.
+  max_sft_steps_per_invocation: 1
   # 14B profile tuned for Colab/Kaggle VRAM constraints.
   base_model: "unsloth/Qwen2.5-14B-Instruct-bnb-4bit"
-  # Dense fallback when Unsloth / low-bit CUDA runtime is unavailable.
+  # Used by shared/model_runtime helpers in edge cases; SFT/GRPO/baseline do not use dense fallback.
   fallback_base_model: "Qwen/Qwen2.5-3B-Instruct"
   max_seq_length: 1536
   lora_rank: 16
@@ -33,6 +41,10 @@ sft:
   optimizer: "adamw_8bit"
   fallback_optimizer: "adamw_torch"
   baseline_sim_episodes: 20
+  # After each post-SFT baseline, compare to previous Hub metrics; optional override file.
+  regression_guard: true
+  regression_min_delta_success_rate: 0.0
+  regression_min_delta_mean_reward: 0.0
 
 gnn:
   hidden_dim: 64

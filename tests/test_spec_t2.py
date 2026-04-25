@@ -498,9 +498,14 @@ class TestSFTPreflight:
         monkeypatch.setattr(preflight.hf_auth, "get_username", lambda: "hf-user")
         monkeypatch.setattr(preflight.hf_auth, "get_token", lambda: "hf-token")
         monkeypatch.setattr(preflight, "HfApi", lambda token=None: FakeApi())
-        monkeypatch.setattr(preflight, "detect_current_batch", lambda namespace: 0)
+        monkeypatch.setattr(
+            preflight, "detect_current_batch", lambda namespace, campaign=None: 0
+        )
         monkeypatch.setattr(preflight.hf_io, "pull_reviewed_batch", lambda batch_num, local_dir: batch_path)
-        monkeypatch.setattr(preflight, "try_import_unsloth", lambda: (object(), None))
+        monkeypatch.setattr(
+            "shared.model_runtime.try_import_unsloth",
+            lambda: (object(), None),
+        )
         monkeypatch.setattr(preflight.torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(preflight.torch.cuda, "get_device_name", lambda index=0: "T4")
         monkeypatch.setattr(preflight, "verify_disk_space", lambda threshold_gb=20.0: (True, 42.0))
@@ -576,7 +581,7 @@ class TestSFTPreflight:
         assert result.ok is False
         assert any("example_id" in err for err in result.errors)
 
-    def test_preflight_unsloth_failure_warns_when_fallback_configured(
+    def test_preflight_unsloth_import_failure_fails_preflight(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
@@ -589,19 +594,18 @@ class TestSFTPreflight:
             "load_config",
             lambda config_path=None: {
                 "hf_namespace": "testns",
-                "sft": {"fallback_base_model": "Qwen/Qwen2.5-3B-Instruct"},
+                "sft": {"campaign": "legacy_30"},
             },
         )
         monkeypatch.setattr(
-            preflight,
-            "try_import_unsloth",
+            "shared.model_runtime.try_import_unsloth",
             lambda: (None, "ModuleNotFoundError: torchvision"),
         )
 
         result = preflight.run_preflight()
 
-        assert result.ok is True
-        assert any("fallback" in warning.lower() for warning in result.warnings)
+        assert result.ok is False
+        assert any("unsloth" in err.lower() for err in result.errors)
 
 
 # =====================================================================

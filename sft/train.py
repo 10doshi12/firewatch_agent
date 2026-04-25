@@ -2,16 +2,22 @@
 train.py — SFT Training Orchestrator (SPEC-T2 §4-§11)
 
 CLI entry point for the SFT training pipeline.
-One invocation processes one batch. Thirty invocations total across the campaign.
+One invocation processes one or more steps (see ``MAX_SFT_STEPS``). Default campaign
+``paired_15``: 15 training steps from 30 reviewed data files (two files per step).
+Use ``legacy_30`` for one SFT step per reviewed file (30 steps).
 
-7-phase pipeline per batch:
-    Phase 1: Detect current batch + pull state from HF
-    Phase 2: Load the batch JSONL
-    Phase 3: Train GNN on CPU to convergence
-    Phase 4: Run GNN inference for blurb generation
-    Phase 5: VRAM handoff (cleanup GPU memory)
-    Phase 6: Load base LLM + LoRA, run TRL SFTTrainer
-    Phase 7: Push new state to HF + auto-trigger baseline
+7-phase pipeline per training step (incremental):
+    Training id ``k`` is monotonic: after each run, GNN + LoRA are pushed to Hub
+    under ``batch_k``; the next run ``k+1`` **always** pulls those weights (GNN
+    ``gnn/batch_{k}.pt``, LoRA ``batch_k/adapter``) as the starting point, then
+    saves updated weights as ``batch_{k+1}``. Run 0 starts from base LLM + fresh LoRA.
+    Phase 1: Detect next step + pull previous artifacts from HF
+    Phase 2: Load reviewed JSONL(s) for this step
+    Phase 3: Train GNN (init from previous GNN checkpoint when k>0)
+    Phase 4: GNN inference for blurbs
+    Phase 5: VRAM handoff
+    Phase 6: LLM SFT (LoRA init from previous step's adapter when k>0)
+    Phase 7: Push new GNN + LoRA to HF + optional baseline
 
 Usage:
     python -m firewatch_agent.sft.train
@@ -23,6 +29,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -63,6 +70,12 @@ from gnn.train_gnn import (  # noqa: E402
     train_gnn,
 )
 
+from sft.campaign import (  # noqa: E402
+    FINAL_TRAINING_RUN_PAIRED,
+    TRAINING_RUNS_PAIRED,
+    data_batches_for_run,
+    detect_next_sft_step,
+)
 from sft.dataset import load_batch  # noqa: E402
 from sft.prompt import format_chat_messages, format_sft_prompt  # noqa: E402
 
@@ -73,13 +86,35 @@ from sft.prompt import format_chat_messages, format_sft_prompt  # noqa: E402
 
 
 def load_config(config_path: Path | None = None) -> dict:
-    """Load training configuration from config.yaml."""
+    """Load training configuration from config.yaml.
+
+    If ``SFT_APPLY_REGRESSION_OVERRIDE=1`` and ``sft_regression_override.yaml`` exists
+    (written by ``eval.regression_guard``), merge suggested learning rate into ``sft``.
+    """
     if config_path is None:
         config_path = _AGENT_ROOT / "config.yaml"
+    cfg: dict = {}
     if config_path.exists():
         with open(config_path) as f:
-            return yaml.safe_load(f) or {}
-    return {}
+            cfg = yaml.safe_load(f) or {}
+    apply = os.environ.get("SFT_APPLY_REGRESSION_OVERRIDE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    override_path = _AGENT_ROOT / "sft_regression_override.yaml"
+    if apply and override_path.exists():
+        with open(override_path) as f:
+            over = yaml.safe_load(f) or {}
+        if over.get("regression_detected") and over.get("suggested_learning_rate_mult") is not None:
+            sft = cfg.setdefault("sft", {})
+            base_lr = float(sft.get("learning_rate", 2e-5))
+            mult = float(over["suggested_learning_rate_mult"])
+            sft["learning_rate"] = base_lr * mult
+            print(
+                f"[train] Applied sft_regression_override.yaml: learning_rate {base_lr} -> {sft['learning_rate']}"
+            )
+    return cfg
 
 
 def trl_sft_sequence_kwargs(max_seq_length: int) -> dict[str, int]:
@@ -97,77 +132,16 @@ def trl_sft_sequence_kwargs(max_seq_length: int) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Detect current batch and pull state
+# Phase 1: Detect current step and pull state
 # ---------------------------------------------------------------------------
 
 
-def detect_current_batch(namespace: str) -> int | None:
+def detect_current_batch(namespace: str, campaign: str | None = None) -> int | None:
     """
-    Determine the next batch to train by querying HuggingFace Hub.
-
-    Logic:
-        1. List reviewed batches in dataset repo
-        2. List trained LoRA folders in SFT model repo
-        3. Current batch = lowest reviewed batch without a trained LoRA
-
-    Returns:
-        Batch number (0-29), or None if campaign complete.
+    Backwards-compatible name. Pass ``campaign`` from config ``sft.campaign``
+    (``paired_15`` or ``legacy_30``), or set env ``SFT_CAMPAIGN``.
     """
-    from huggingface_hub import HfApi
-
-    api = HfApi(token=hf_auth.get_token())
-    dataset_repo = f"{namespace}/firewatch-sft-data"
-    model_repo = f"{namespace}/firewatch-agent-sft"
-
-    # Get reviewed batches
-    try:
-        files = api.list_repo_files(dataset_repo, repo_type="dataset")
-        reviewed = sorted(
-            f for f in files
-            if f.startswith("reviewed/batch_") and f.endswith(".jsonl")
-        )
-    except Exception as exc:
-        if "404" in str(exc):
-            print("[train] No reviewed batches found on HF — dataset repo missing")
-            sys.exit(1)
-        raise
-
-    if not reviewed:
-        print("[train] No reviewed batches found on HF")
-        sys.exit(1)
-
-    # Extract batch numbers from filenames
-    reviewed_nums: set[int] = set()
-    for f in reviewed:
-        # reviewed/batch_000.jsonl -> 0
-        name = f.split("/")[-1].replace("batch_", "").replace(".jsonl", "")
-        try:
-            reviewed_nums.add(int(name))
-        except ValueError:
-            continue
-
-    # Get trained LoRA folders
-    trained_nums: set[int] = set()
-    try:
-        files = api.list_repo_files(model_repo, repo_type="model")
-        for f in files:
-            parts = f.split("/")
-            if len(parts) >= 2 and parts[0].startswith("batch_"):
-                name = parts[0].replace("batch_", "")
-                try:
-                    trained_nums.add(int(name))
-                except ValueError:
-                    continue
-    except Exception:
-        pass  # Model repo may not exist yet
-
-    # Find lowest untrained reviewed batch
-    untrained = sorted(reviewed_nums - trained_nums)
-    if not untrained:
-        print("[train] SFT campaign complete — all reviewed batches have trained LoRAs")
-        return None
-
-    return untrained[0]
+    return detect_next_sft_step(namespace, campaign)
 
 
 def pull_state(
@@ -176,41 +150,78 @@ def pull_state(
     local_dir: Path,
 ) -> tuple[Path, Path | None, Path | None]:
     """
-    Pull artifacts for the current batch.
+    Legacy: single data batch. Returns (one jsonl path, prev gnn, prev lora).
 
-    Returns:
-        (batch_jsonl_path, prev_gnn_checkpoint_path, prev_lora_path)
+    **Incremental weights:** For step ``batch_num == N``, pulls GNN checkpoint
+    produced at the end of step ``N-1`` (``gnn/batch_{N-1}.pt``) and LoRA
+    ``batch_{N-1}/`` so training continues from the last saved state.
     """
-    # Pull reviewed batch
     batch_path = hf_io.pull_reviewed_batch(batch_num, local_dir)
-
-    # Pull previous GNN checkpoint (batch N-1)
     gnn_path = hf_io.pull_gnn_checkpoint(batch_num, local_dir)
-
-    # Pull previous SFT LoRA (batch N-1)
     lora_path = None
     if batch_num > 0:
         model_repo = f"{namespace}/firewatch-agent-sft"
-        subfolder = f"batch_{batch_num - 1:03d}"
-        lora_path = hf_io.pull_lora_adapter(model_repo, subfolder, local_dir)
-
+        lora_path = hf_io.pull_lora_adapter(
+            model_repo, f"batch_{batch_num - 1:03d}", local_dir
+        )
     return batch_path, gnn_path, lora_path
 
 
-def pull_all_reviewed_batches(namespace: str, batch_num: int, local_dir: Path) -> list[dict]:
-    """Pull previous reviewed batches 0..batch_num-1 for GNN accumulation.
-
-    The current batch (batch_num) is already in memory as `examples` and must be
-    appended at the call site to avoid a redundant HF fetch.
+def pull_state_paired(
+    namespace: str,
+    run_idx: int,
+    local_dir: Path,
+) -> tuple[tuple[Path, Path], Path | None, Path | None]:
     """
+    Paired mode: two reviewed JSONLs per training run. Hub artifact folder index
+    matches ``run_idx`` (0..14), not the data file indices.
+
+    **Incremental weights:** Same as legacy — for run ``k`` uses GNN + LoRA from
+    run ``k-1`` (pushed after run ``k-1`` completed). Run 0 has no prior weights.
+    """
+    a, b = data_batches_for_run(run_idx)
+    path_a = hf_io.pull_reviewed_batch(a, local_dir)
+    path_b = hf_io.pull_reviewed_batch(b, local_dir)
+    gnn_path = hf_io.pull_gnn_checkpoint(run_idx, local_dir)
+    lora_path = None
+    if run_idx > 0:
+        model_repo = f"{namespace}/firewatch-agent-sft"
+        lora_path = hf_io.pull_lora_adapter(
+            model_repo, f"batch_{run_idx - 1:03d}", local_dir
+        )
+    return (path_a, path_b), gnn_path, lora_path
+
+
+def pull_all_reviewed_batches(namespace: str, batch_num: int, local_dir: Path) -> list[dict]:
+    """Legacy GNN accumulation: data batches 0..batch_num-1."""
     all_examples: list[dict] = []
-    for n in range(batch_num):  # 0..batch_num-1 only
+    for n in range(batch_num):
         try:
             batch_path = hf_io.pull_reviewed_batch(n, local_dir)
             all_examples.extend(load_batch(batch_path))
         except Exception as exc:
             print(f"[train] WARNING: Could not pull batch {n:03d} for GNN accumulation: {exc}")
     return all_examples
+
+
+def pull_accumulated_paired(
+    namespace: str,
+    run_idx: int,
+    local_dir: Path,
+) -> list[dict]:
+    """GNN accumulation for paired mode: all examples from completed runs 0..run_idx-1."""
+    out: list[dict] = []
+    for r in range(run_idx):
+        da, db = data_batches_for_run(r)
+        for b in (da, db):
+            try:
+                p = hf_io.pull_reviewed_batch(b, local_dir)
+                out.extend(load_batch(p))
+            except Exception as exc:
+                print(
+                    f"[train] WARNING: Could not pull batch {b:03d} for GNN accumulation: {exc}"
+                )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -257,8 +268,11 @@ def load_llm_and_train(
     """
     Load base LLM + LoRA and run SFT training.
 
+    If ``prev_lora_path`` is set, LoRA weights are **continued** from the previous
+    training id (incremental SFT). Otherwise a new LoRA is attached to the base model.
+
     Returns:
-        Path to saved LoRA adapter directory.
+        Path to saved LoRA adapter directory for this training id.
     """
     sft_config = config.get("sft", {})
     max_seq_length = sft_config.get("max_seq_length", 2048)
@@ -281,22 +295,23 @@ def load_llm_and_train(
     output_dir = CHECKPOINTS_DIR / "sft_llm" / f"batch_{batch_num:03d}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Try Unsloth first, fall back to a dense transformers + peft path ---
+    # --- Unsloth is required (4-bit + LoRA); no dense PyTorch fallback ---
     FastLanguageModel, unsloth_error = try_import_unsloth()
-    use_unsloth = FastLanguageModel is not None
-    if use_unsloth:
-        print("[train] Using Unsloth for model loading")
-    else:
-        print(f"[train] Unsloth unavailable ({unsloth_error}), using transformers + peft")
+    if FastLanguageModel is None:
+        raise RuntimeError(
+            f"[train] Unsloth is required for SFT but failed to import: {unsloth_error}. "
+            "Install unsloth in a CUDA environment. No fallback training path is supported."
+        )
+    print("[train] Using Unsloth for model loading")
 
     base_model = resolve_base_model_for_training(
         sft_config,
-        use_low_bit_runtime=use_unsloth,
+        use_low_bit_runtime=True,
         prev_lora_path=prev_lora_path,
     )
     optimizer_name = resolve_optimizer_for_runtime(
         sft_config,
-        use_low_bit_runtime=use_unsloth,
+        use_low_bit_runtime=True,
     )
     configured_base_model = sft_config.get("base_model", base_model)
     if base_model != configured_base_model:
@@ -310,61 +325,26 @@ def load_llm_and_train(
             f"{sft_config.get('optimizer')} to {optimizer_name}"
         )
 
-    if use_unsloth:
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=base_model,
-            max_seq_length=max_seq_length,
-            dtype=None,
-            load_in_4bit=True,
-        )
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=base_model,
+        max_seq_length=max_seq_length,
+        dtype=None,
+        load_in_4bit=True,
+    )
 
-        # Apply LoRA
-        if prev_lora_path and prev_lora_path.exists():
-            from peft import PeftModel
-            model = PeftModel.from_pretrained(model, str(prev_lora_path))
-            print(f"[train] Loaded previous LoRA from {prev_lora_path}")
-        else:
-            model = FastLanguageModel.get_peft_model(
-                model,
-                r=lora_rank,
-                lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-                target_modules=target_modules,
-                use_gradient_checkpointing="unsloth",
-            )
+    if prev_lora_path and prev_lora_path.exists():
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, str(prev_lora_path))
+        print(f"[train] Loaded previous LoRA from {prev_lora_path}")
     else:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from peft import LoraConfig, PeftModel, get_peft_model
-
-        # Dense fallback path. We intentionally avoid bitsandbytes here because
-        # this branch is entered precisely when the low-bit runtime is unhealthy.
-        load_kwargs = {
-            "device_map": {"": 0} if torch.cuda.is_available() else "cpu",
-        }
-        chosen_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        try:
-            model = AutoModelForCausalLM.from_pretrained(base_model, dtype=chosen_dtype, **load_kwargs)
-        except TypeError:
-            model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=chosen_dtype, **load_kwargs)
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
-
-        # Dense fallback still needs input grads so LoRA receives signal.
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-
-        if prev_lora_path and prev_lora_path.exists():
-            model = PeftModel.from_pretrained(model, str(prev_lora_path), is_trainable=True)
-            print(f"[train] Loaded previous LoRA from {prev_lora_path}")
-        else:
-            lora_config = LoraConfig(
-                r=lora_rank,
-                lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-                target_modules=target_modules,
-                bias="none",
-                task_type="CAUSAL_LM",
-            )
-            model = get_peft_model(model, lora_config)
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=target_modules,
+            use_gradient_checkpointing="unsloth",
+        )
 
     # Ensure tokenizer has pad token
     if tokenizer.pad_token is None:
@@ -420,11 +400,7 @@ def load_llm_and_train(
         dataset_text_field="text",
     )
     sftconfig_kwargs.update(trl_sft_sequence_kwargs(max_seq_length))
-    # Unsloth handles checkpointing internally; the dense fallback relies on HF's
-    # checkpointing to stay inside T4 memory limits.
-    if not use_unsloth:
-        sftconfig_kwargs["gradient_checkpointing"] = True
-        sftconfig_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+    # Unsloth handles checkpointing internally (no extra HF gradient checkpointing).
 
     training_args = SFTConfig(**sftconfig_kwargs)
 
@@ -447,10 +423,7 @@ def load_llm_and_train(
     adapter_dir = output_dir / "adapter"
     adapter_dir.mkdir(parents=True, exist_ok=True)
 
-    if use_unsloth:
-        model.save_pretrained(str(adapter_dir), save_method="lora")
-    else:
-        model.save_pretrained(str(adapter_dir))
+    model.save_pretrained(str(adapter_dir), save_method="lora")
 
     tokenizer.save_pretrained(str(adapter_dir))
 
@@ -469,6 +442,8 @@ def push_state(
     gnn_checkpoint_path: Path,
     lora_adapter_dir: Path,
     normalization_path: Path,
+    *,
+    paired_campaign: bool = True,
 ) -> None:
     """Push trained artifacts to HuggingFace Hub."""
     # Push GNN checkpoint
@@ -493,8 +468,15 @@ def push_state(
     # Push LoRA adapter
     hf_io.push_sft_lora(batch_num, lora_adapter_dir)
 
-    # If final batch (N=29), also push to latest/
-    if batch_num == 29:
+    print(
+        f"[train] Incremental save on Hub: gnn/batch_{batch_num:03d}.pt + "
+        f"LoRA at batch_{batch_num:03d}/ — the next SFT run will load these as init."
+    )
+
+    is_final = (paired_campaign and batch_num == FINAL_TRAINING_RUN_PAIRED) or (
+        not paired_campaign and batch_num == 29
+    )
+    if is_final:
         model_repo = f"{namespace}/firewatch-agent-sft"
         try:
             api.upload_folder(
@@ -540,70 +522,78 @@ def auto_trigger_baseline(
 # ---------------------------------------------------------------------------
 
 
-def run_sft_batch(config_path: Path | None = None) -> None:
-    """
-    Run the full 7-phase SFT pipeline for one batch.
-    Automatically detects the next batch to train.
-    """
-    start_time = time.monotonic()
-    config = load_config(config_path)
+def _run_single_sft_step(
+    namespace: str,
+    step_idx: int,
+    paired: bool,
+    config: dict,
+    local_dir: Path,
+) -> None:
+    """One full 7-phase pipeline for training index ``step_idx``."""
+    if step_idx > 0:
+        print(
+            f"[train] Incremental run {step_idx}: will init GNN from "
+            f"gnn/batch_{step_idx - 1:03d}.pt and LoRA from "
+            f"firewatch-agent-sft/batch_{step_idx - 1:03d}/ (previous Hub save)"
+        )
+    else:
+        print(
+            "[train] First training run: fresh GNN + new LoRA on base model "
+            "(no prior step on Hub)"
+        )
 
-    # --- Setup ---
-    print(f"[train] Platform: {PLATFORM}")
-    print(f"[train] Working directory: {WORKING_DIR}")
+    if paired:
+        paths, prev_gnn_path, prev_lora_path = pull_state_paired(
+            namespace, step_idx, local_dir
+        )
+        path_a, path_b = paths
+        print(f"\n[train] === Phase 2: Load paired runs (data {path_a.name} + {path_b.name}) ===")
+        examples = load_batch(path_a) + load_batch(path_b)
+    else:
+        batch_path, prev_gnn_path, prev_lora_path = pull_state(
+            namespace, step_idx, local_dir
+        )
+        print(f"\n[train] === Phase 2: Load batch {step_idx:03d} ===")
+        examples = load_batch(batch_path)
 
-    ok, free_gb = verify_disk_space(threshold_gb=20.0)
-    if not ok:
-        print("[train] WARNING: Low disk space. Proceeding anyway.")
+    print(f"[train] Loaded {len(examples)} examples for SFT")
 
-    # Authenticate
-    username = hf_auth.get_username()
-    namespace = config.get("hf_namespace") or username
-    print(f"[train] HF namespace: {namespace}")
-
-    # ===== Phase 1: Detect current batch + pull state =====
-    print("\n[train] === Phase 1: Detect batch + pull state ===")
-    batch_num = detect_current_batch(namespace)
-    if batch_num is None:
-        return
-
-    print(f"[train] Training batch {batch_num:03d}")
-    local_dir = WORKING_DIR / "sft_run"
-    local_dir.mkdir(parents=True, exist_ok=True)
-
-    batch_path, prev_gnn_path, prev_lora_path = pull_state(namespace, batch_num, local_dir)
-
-    # ===== Phase 2: Load the batch =====
-    print(f"\n[train] === Phase 2: Load batch {batch_num:03d} ===")
-    examples = load_batch(batch_path)
-    print(f"[train] Loaded {len(examples)} examples")
-
-    # ===== Phase 3: Train GNN =====
-    print(f"\n[train] === Phase 3: Train GNN (all batches 0..{batch_num:03d}) ===")
     gnn_config = config.get("gnn", {})
-
-    # Normalization from previous batch
     norm_path = None
     if prev_gnn_path and prev_gnn_path.parent.exists():
         candidate = prev_gnn_path.parent / "normalization.json"
         if candidate.exists():
             norm_path = candidate
 
-    all_gnn_examples = pull_all_reviewed_batches(namespace, batch_num, local_dir) + examples
+    if paired:
+        print(
+            f"\n[train] === Phase 3: Train GNN (accumulated runs 0..{step_idx - 1} + current pair) ==="
+        )
+        prev_acc = pull_accumulated_paired(namespace, step_idx, local_dir)
+        all_gnn_examples = prev_acc + examples
+    else:
+        print(
+            f"\n[train] === Phase 3: Train GNN (all data batches 0..{step_idx - 1:03d} + current) ==="
+        )
+        all_gnn_examples = pull_all_reviewed_batches(
+            namespace, step_idx, local_dir
+        ) + examples
+
     if not all_gnn_examples:
-        raise RuntimeError(f"[train] No examples available for GNN training at batch {batch_num:03d}")
-    print(f"[train] GNN training on {len(all_gnn_examples)} accumulated examples (batches 0..{batch_num:03d})")
+        raise RuntimeError(
+            f"[train] No examples available for GNN training at step {step_idx:03d}"
+        )
+    print(f"[train] GNN training on {len(all_gnn_examples)} accumulated examples")
 
     gnn_ckpt_path, gnn_norm_path = train_gnn(
         batch_examples=all_gnn_examples,
-        batch_num=batch_num,
+        batch_num=step_idx,
         checkpoint_dir=CHECKPOINTS_DIR,
         prev_checkpoint_path=prev_gnn_path,
         normalization_path=norm_path,
         config=gnn_config,
     )
 
-    # ===== Phase 4: GNN inference for blurb generation =====
     print(f"\n[train] === Phase 4: GNN inference ===")
     gnn_model = GraphSAGEModel(
         in_channels=NUM_FEATURES,
@@ -620,47 +610,114 @@ def run_sft_batch(config_path: Path | None = None) -> None:
 
     inference_results = run_gnn_inference(gnn_model, examples, normalizer)
 
-    # Generate blurbs
     blurbs: dict[str, str] = {}
     for example_id, (logits, embeddings) in inference_results.items():
         blurbs[example_id] = serialize_blurb(logits)
 
     print(f"[train] Generated {len(blurbs)} blurbs")
 
-    # ===== Phase 5: VRAM handoff =====
     print(f"\n[train] === Phase 5: VRAM handoff ===")
     vram_handoff(gnn_model)
     gnn_model = None  # noqa: F841
 
-    # ===== Phase 6: LLM SFT Training =====
     print(f"\n[train] === Phase 6: LLM SFT Training ===")
     adapter_dir = load_llm_and_train(
         examples=examples,
         blurbs=blurbs,
-        batch_num=batch_num,
+        batch_num=step_idx,
         prev_lora_path=prev_lora_path,
         config=config,
     )
 
-    # ===== Phase 7: Push state + auto-trigger baseline =====
     print(f"\n[train] === Phase 7: Push state + baseline ===")
-    push_state(namespace, batch_num, gnn_ckpt_path, adapter_dir, gnn_norm_path)
+    push_state(
+        namespace,
+        step_idx,
+        gnn_ckpt_path,
+        adapter_dir,
+        gnn_norm_path,
+        paired_campaign=paired,
+    )
 
-    # Auto-trigger baseline
-    auto_trigger_baseline(batch_num)
+    sft_cfg = config.get("sft", {})
+    skip_bl = os.environ.get("SKIP_AUTO_BASELINE", "").lower() in ("1", "true", "yes")
+    if sft_cfg.get("skip_auto_baseline"):
+        skip_bl = True
+    if not skip_bl:
+        auto_trigger_baseline(step_idx)
+        try:
+            from eval.regression_guard import check_regression_after_baseline  # noqa: WPS433
 
-    # Final summary
+            check_regression_after_baseline(
+                namespace=namespace,
+                local_dir=local_dir,
+                config=config,
+            )
+        except ImportError:
+            pass
+        except Exception as exc:
+            print(f"[train] regression_guard (non-fatal): {exc}")
+    else:
+        print("[train] SKIP_AUTO_BASELINE — no post-SFT baseline this step")
+
+
+def run_sft_batch(config_path: Path | None = None) -> None:
+    """
+    Run the 7-phase SFT pipeline for one or more steps (``MAX_SFT_STEPS``, default 1).
+    """
+    start_time = time.monotonic()
+    config = load_config(config_path)
+    sft_cfg = config.get("sft", {})
+    campaign = sft_cfg.get("campaign", "paired_15")
+    paired = campaign.strip().lower() in ("paired_15", "paired", "15")
+
+    print(f"[train] Platform: {PLATFORM}")
+    print(f"[train] Working directory: {WORKING_DIR}")
+    print(f"[train] SFT campaign: {campaign} (paired={paired})")
+
+    ok, free_gb = verify_disk_space(threshold_gb=20.0)
+    if not ok:
+        print("[train] WARNING: Low disk space. Proceeding anyway.")
+
+    username = hf_auth.get_username()
+    namespace = config.get("hf_namespace") or username
+    print(f"[train] HF namespace: {namespace}")
+
+    max_steps = int(os.environ.get("MAX_SFT_STEPS", "1"))
+    if sft_cfg.get("max_sft_steps_per_invocation") is not None:
+        max_steps = int(sft_cfg["max_sft_steps_per_invocation"])
+
+    local_dir = WORKING_DIR / "sft_run"
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    for _ in range(max_steps):
+        print("\n[train] === Phase 1: Detect next SFT step ===")
+        step_idx = detect_current_batch(namespace, campaign)
+        if step_idx is None:
+            return
+
+        label = (
+            f"training run {step_idx}/{TRAINING_RUNS_PAIRED - 1} (paired)"
+            if paired
+            else f"data batch {step_idx:03d} (legacy)"
+        )
+        print(f"[train] Next step: {label}")
+
+        step_start = time.monotonic()
+        _run_single_sft_step(
+            namespace=namespace,
+            step_idx=step_idx,
+            paired=paired,
+            config=config,
+            local_dir=local_dir,
+        )
+        print(
+            f"[train] Step wall time: {time.monotonic() - step_start:.1f}s"
+        )
+
     wall_time = time.monotonic() - start_time
-    summary = {
-        "batch_num": batch_num,
-        "total_examples": len(examples),
-        "gnn_checkpoint": str(gnn_ckpt_path),
-        "lora_adapter": str(adapter_dir),
-        "wall_time_seconds": round(wall_time, 2),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    print(f"\n[train] === Complete ===")
-    print(json.dumps(summary, indent=2))
+    print(f"\n[train] === Invocation complete ({max_steps} step(s)) ===")
+    print(f"[train] Total wall time: {wall_time:.1f}s")
 
 
 # ---------------------------------------------------------------------------

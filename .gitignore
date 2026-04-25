@@ -18,6 +18,9 @@ dist/
 build/
 wheels/
 
+# Local regression handoff (from eval.regression_guard); merge with SFT_APPLY_REGRESSION_OVERRIDE=1
+sft_regression_override.yaml
+
 # Training artifacts (large binaries, generated at runtime)
 checkpoints/
 sft_data/
