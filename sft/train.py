@@ -77,6 +77,20 @@ def load_config(config_path: Path | None = None) -> dict:
     return {}
 
 
+def trl_sft_sequence_kwargs(max_seq_length: int) -> dict[str, int]:
+    """SFTConfig sequence cap: TRL uses ``max_length``; older builds used ``max_seq_length``."""
+    import inspect
+
+    from trl import SFTConfig
+
+    params = inspect.signature(SFTConfig.__init__).parameters
+    if "max_length" in params:
+        return {"max_length": max_seq_length}
+    if "max_seq_length" in params:
+        return {"max_seq_length": max_seq_length}
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: Detect current batch and pull state
 # ---------------------------------------------------------------------------
@@ -375,7 +389,7 @@ def load_llm_and_train(
         lr_scheduler_type=scheduler,
         warmup_ratio=warmup_ratio,
         optim=optimizer_name,
-        max_seq_length=max_seq_length,
+        **trl_sft_sequence_kwargs(max_seq_length),
         save_strategy="epoch",
         save_total_limit=1,
         report_to="none",

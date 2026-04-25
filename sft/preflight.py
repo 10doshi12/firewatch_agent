@@ -2,7 +2,7 @@
 preflight.py — cheap readiness checks before real SFT GPU training.
 
 This module verifies auth, Hub repo layout, reviewed data compliance,
-Unsloth availability, CUDA, and disk before `sft.train` loads a 7B model.
+Unsloth availability, CUDA, and disk before `sft.train` loads the base LLM.
 """
 
 from __future__ import annotations

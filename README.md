@@ -123,10 +123,12 @@ review, upload, and offline tests. These steps do not require a GPU.
 Use Kaggle when the free T4 runtime is enough and `HF_TOKEN` is stored in
 Kaggle Secrets. Use Colab when A100/T4 availability or interactive
 debugging is better. The notebooks in `notebooks/` are thin launchers:
-they install `uv` + Unsloth, load `HF_TOKEN`, run `sft.preflight`, then
-run `sft.train`. They do not contain a separate training implementation.
+they install `uv`, clone the repo, run `uv sync`, then install Unsloth
+into the **same** environment with `uv pip install "unsloth[colab-new]
+@ git+..."` (or `[kaggle]` on Kaggle) so `uv run python -m sft.preflight`
+can import it. Load `HF_TOKEN`, run `sft.preflight`, then `sft.train`.
 
-Before any real 7B SFT run, `sft.preflight` checks HF auth, required Hub
+Before any real SFT run, `sft.preflight` checks HF auth, required Hub
 repos, reviewed batch discovery, batch compliance, Unsloth import, CUDA,
 and disk space. It should pass before loading the base model.
 

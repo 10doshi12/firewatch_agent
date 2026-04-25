@@ -578,6 +578,22 @@ class TestSFTPreflight:
 
 
 # =====================================================================
+# TRL / SFTConfig API compatibility
+# =====================================================================
+
+
+class TestTRLSequenceKwargs:
+    def test_trl_sft_sequence_kwargs_matches_installed_trl(self):
+        from sft.train import trl_sft_sequence_kwargs
+
+        kw = trl_sft_sequence_kwargs(1536)
+        assert len(kw) == 1
+        key = next(iter(kw))
+        assert key in ("max_length", "max_seq_length")
+        assert kw[key] == 1536
+
+
+# =====================================================================
 # Cloud notebook launcher tests
 # =====================================================================
 
@@ -593,3 +609,4 @@ class TestTrainingNotebooks:
             assert "uv run python -m sft.train --config config.yaml" in content
             assert content.index("sft.preflight") < content.index("sft.train")
             assert "unsloth" in content.lower()
+            assert "uv pip install" in content and "unsloth" in content
