@@ -39,6 +39,8 @@ def load_token() -> str:
 
         client = UserSecretsClient()
         token = client.get_secret("HF_TOKEN")
+        if not token:
+            raise RuntimeError("[hf_auth] Kaggle Secret HF_TOKEN is empty or missing")
         print("[hf_auth] Token loaded from Kaggle Secrets")
     except ImportError:
         pass
@@ -52,6 +54,8 @@ def load_token() -> str:
         from google.colab import userdata
 
         token = userdata.get("HF_TOKEN")
+        if not token:
+            raise RuntimeError("[hf_auth] Colab userdata HF_TOKEN is empty or missing")
         print("[hf_auth] Token loaded from Colab userdata")
     except ImportError:
         pass
@@ -111,3 +115,28 @@ def get_token() -> str:
     if not token:
         token = load_token()
     return token
+
+
+def resolve_namespace(config: dict | None = None, username: str | None = None) -> str:
+    """
+    Resolve the Hugging Face namespace used for all Firewatch artifact repos.
+
+    Resolution order is intentionally shared by preflight, SFT, GRPO, eval, and
+    low-level Hub I/O so a Space variable cannot pass preflight and then train
+    against the authenticated user's personal namespace by accident.
+    """
+    configured = None
+    if isinstance(config, dict):
+        configured = config.get("hf_namespace")
+
+    raw_namespace = configured or os.environ.get("HF_NAMESPACE") or username
+    if raw_namespace is None:
+        raw_namespace = get_username()
+
+    namespace = str(raw_namespace).strip()
+    if not namespace:
+        raise RuntimeError(
+            "[hf_auth] HF namespace resolved to an empty value. Set hf_namespace "
+            "in config.yaml or HF_NAMESPACE in the environment."
+        )
+    return namespace

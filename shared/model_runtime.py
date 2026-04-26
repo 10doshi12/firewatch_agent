@@ -137,3 +137,40 @@ def resolve_optimizer_for_runtime(grpo_or_sft_config: dict, *, use_low_bit_runti
     return str(
         grpo_or_sft_config.get("fallback_optimizer", DEFAULT_FALLBACK_OPTIMIZER)
     )
+
+
+def trainable_parameter_count(model: object) -> tuple[int, int]:
+    """Return ``(trainable, total)`` parameter counts for diagnostics."""
+    trainable = 0
+    total = 0
+    parameters = getattr(model, "parameters", None)
+    if not callable(parameters):
+        return trainable, total
+
+    for param in parameters():
+        numel = int(param.numel())
+        total += numel
+        if getattr(param, "requires_grad", False):
+            trainable += numel
+    return trainable, total
+
+
+def require_trainable_parameters(model: object, context: str) -> tuple[int, int]:
+    """
+    Fail fast when LoRA/GRPO setup leaves every parameter frozen.
+
+    ``peft.PeftModel.from_pretrained`` defaults to inference mode
+    (``is_trainable=False``). Without this guard, a resumed training run can
+    spend expensive GPU time while updating nothing.
+    """
+    trainable, total = trainable_parameter_count(model)
+    print(
+        f"[model_runtime] {context} trainable params: {trainable:,} / {total:,} "
+        f"({100 * trainable / max(total, 1):.4f}%)"
+    )
+    if trainable <= 0:
+        raise RuntimeError(
+            f"{context} has no trainable parameters. If this is a PEFT adapter, "
+            "load it with is_trainable=True before starting training."
+        )
+    return trainable, total

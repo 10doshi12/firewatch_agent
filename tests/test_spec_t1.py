@@ -99,6 +99,21 @@ class TestHfAuth:
             token2 = hf_auth.load_token()
             assert token1 == token2
 
+    def test_resolve_namespace_prefers_config(self):
+        from shared.hf_auth import resolve_namespace
+
+        with patch.dict(os.environ, {"HF_NAMESPACE": "env-ns"}):
+            assert (
+                resolve_namespace({"hf_namespace": "config-ns"}, username="user-ns")
+                == "config-ns"
+            )
+
+    def test_resolve_namespace_uses_env_before_username(self):
+        from shared.hf_auth import resolve_namespace
+
+        with patch.dict(os.environ, {"HF_NAMESPACE": "env-ns"}):
+            assert resolve_namespace({"hf_namespace": None}, username="user-ns") == "env-ns"
+
 
 # =====================================================================
 # hf_io.py tests
@@ -121,6 +136,28 @@ class TestHfIo:
             call_count += 1
             if call_count < 2:
                 raise ConnectionError("Connection reset by peer")
+            return "ok"
+
+        result = retry_with_backoff(flaky, max_retries=3, initial_backoff=0.01)
+        assert result == "ok"
+        assert call_count == 2
+
+    def test_retry_with_backoff_retries_hf_http_503_shape(self):
+        """HF Hub/httpx errors expose status through response.status_code."""
+        from shared.hf_io import retry_with_backoff
+        call_count = 0
+
+        class Response:
+            status_code = 503
+
+        class HfLikeError(Exception):
+            response = Response()
+
+        def flaky():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise HfLikeError("temporarily unavailable")
             return "ok"
 
         result = retry_with_backoff(flaky, max_retries=3, initial_backoff=0.01)

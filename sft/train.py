@@ -62,6 +62,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from shared import hf_auth, hf_io  # noqa: E402
 from shared.model_runtime import (  # noqa: E402
+    require_trainable_parameters,
     resolve_base_model_for_training,
     resolve_optimizer_for_runtime,
     try_import_unsloth,
@@ -173,6 +174,17 @@ def trl_sft_sequence_kwargs(max_seq_length: int) -> dict[str, int]:
     if "max_seq_length" in params:
         return {"max_seq_length": max_seq_length}
     return {}
+
+
+def load_peft_adapter_for_training(model: object, adapter_path: Path) -> object:
+    """Load a PEFT adapter for continued training, not frozen inference."""
+    from peft import PeftModel
+
+    return PeftModel.from_pretrained(
+        model,
+        str(adapter_path),
+        is_trainable=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -377,8 +389,7 @@ def load_llm_and_train(
     )
 
     if prev_lora_path and prev_lora_path.exists():
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, str(prev_lora_path))
+        model = load_peft_adapter_for_training(model, prev_lora_path)
         print(f"[train] Loaded previous LoRA from {prev_lora_path}")
     else:
         model = FastLanguageModel.get_peft_model(
@@ -389,6 +400,7 @@ def load_llm_and_train(
             target_modules=target_modules,
             use_gradient_checkpointing="unsloth",
         )
+    require_trainable_parameters(model, "SFT LoRA")
 
     # Ensure tokenizer has pad token
     if tokenizer.pad_token is None:
@@ -467,7 +479,7 @@ def load_llm_and_train(
     adapter_dir = output_dir / "adapter"
     adapter_dir.mkdir(parents=True, exist_ok=True)
 
-    model.save_pretrained(str(adapter_dir), save_method="lora")
+    trainer.model.save_pretrained(str(adapter_dir), save_method="lora")
 
     tokenizer.save_pretrained(str(adapter_dir))
 
@@ -782,7 +794,8 @@ def run_sft_batch(config_path: Path | None = None) -> int:
         print("[train] WARNING: Low disk space. Proceeding anyway.")
 
     username = hf_auth.get_username()
-    namespace = config.get("hf_namespace") or username
+    namespace = hf_auth.resolve_namespace(config, username)
+    os.environ["HF_NAMESPACE"] = namespace
     print(f"[train] HF namespace: {namespace}")
 
     max_steps = int(os.environ.get("MAX_SFT_STEPS", "1"))

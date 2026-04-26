@@ -53,8 +53,7 @@ REQUIRED_REPOS: tuple[tuple[str, str, bool], ...] = (
 
 
 def _resolve_namespace(config: dict, username: str) -> str:
-    namespace = config.get("hf_namespace") or os.environ.get("HF_NAMESPACE") or username
-    return str(namespace)
+    return hf_auth.resolve_namespace(config, username)
 
 
 def _check_repos(api: HfApi, namespace: str) -> tuple[list[str], list[str]]:
@@ -128,6 +127,7 @@ def run_preflight(
         username = hf_auth.get_username()
         token = hf_auth.get_token()
         namespace = _resolve_namespace(config, username)
+        os.environ["HF_NAMESPACE"] = namespace
         details["hf_username"] = username
     except Exception as exc:
         errors.append(f"HF auth failed: {exc}")

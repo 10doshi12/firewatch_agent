@@ -445,6 +445,74 @@ class TestVRAMHandoff:
 
 
 # =====================================================================
+# SFT orchestrator safety tests
+# =====================================================================
+
+
+class TestSFTOrchestratorSafety:
+    def test_previous_lora_loads_trainable(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        from peft import PeftModel
+        from sft.train import load_peft_adapter_for_training
+
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        seen: dict[str, object] = {}
+
+        def fake_from_pretrained(model, model_id, **kwargs):
+            seen["model"] = model
+            seen["model_id"] = model_id
+            seen.update(kwargs)
+            return "loaded-model"
+
+        monkeypatch.setattr(PeftModel, "from_pretrained", fake_from_pretrained)
+
+        model = object()
+        loaded = load_peft_adapter_for_training(model, adapter_dir)
+
+        assert loaded == "loaded-model"
+        assert seen["model"] is model
+        assert seen["model_id"] == str(adapter_dir)
+        assert seen["is_trainable"] is True
+
+    def test_run_sft_batch_uses_env_namespace_before_username(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from sft import train
+
+        seen: dict[str, object] = {}
+
+        monkeypatch.setenv("HF_NAMESPACE", "org-ns")
+        monkeypatch.setattr(
+            train,
+            "load_config",
+            lambda config_path=None: {
+                "hf_namespace": None,
+                "sft": {"campaign": "paired_15", "max_sft_steps_per_invocation": 1},
+            },
+        )
+        monkeypatch.setattr(train, "verify_disk_space", lambda threshold_gb=20.0: (True, 42.0))
+        monkeypatch.setattr(train.hf_auth, "get_username", lambda: "user-ns")
+        monkeypatch.setattr(
+            train,
+            "maybe_run_pretrain_baseline",
+            lambda namespace, local_dir: seen.setdefault("baseline_namespace", namespace),
+        )
+
+        def fake_detect(namespace, campaign=None):
+            seen["detect_namespace"] = namespace
+            return None
+
+        monkeypatch.setattr(train, "detect_current_batch", fake_detect)
+
+        code = train.run_sft_batch()
+
+        assert code == train.EXIT_CAMPAIGN_COMPLETE
+        assert seen["baseline_namespace"] == "org-ns"
+        assert seen["detect_namespace"] == "org-ns"
+
+
+# =====================================================================
 # Config tests
 # =====================================================================
 
@@ -668,6 +736,25 @@ class TestModelRuntimeSelection:
             lora_path=adapter_dir,
         ) == "Qwen/Qwen2.5-3B-Instruct"
 
+    def test_require_trainable_parameters_rejects_frozen_model(self):
+        from shared.model_runtime import require_trainable_parameters
+
+        model = torch.nn.Linear(2, 1)
+        for param in model.parameters():
+            param.requires_grad = False
+
+        with pytest.raises(RuntimeError, match="no trainable parameters"):
+            require_trainable_parameters(model, "test adapter")
+
+    def test_require_trainable_parameters_accepts_lora_like_model(self):
+        from shared.model_runtime import require_trainable_parameters
+
+        model = torch.nn.Linear(2, 1)
+        trainable, total = require_trainable_parameters(model, "test adapter")
+
+        assert trainable > 0
+        assert total >= trainable
+
 
 # =====================================================================
 # TRL / SFTConfig API compatibility
@@ -683,6 +770,17 @@ class TestTRLSequenceKwargs:
         key = next(iter(kw))
         assert key in ("max_length", "max_seq_length")
         assert kw[key] == 1536
+
+    def test_trl_grpo_config_kwargs_filters_unknown_keys(self):
+        from grpo.train import trl_grpo_config_kwargs
+
+        kw = trl_grpo_config_kwargs({
+            "output_dir": "/tmp/firewatch-grpo-test",
+            "__firewatch_unknown__": 123,
+        })
+
+        assert kw["output_dir"] == "/tmp/firewatch-grpo-test"
+        assert "__firewatch_unknown__" not in kw
 
 
 # =====================================================================

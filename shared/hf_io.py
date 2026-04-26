@@ -25,9 +25,7 @@ Utility:
 from __future__ import annotations
 
 import json
-import os
 import time
-import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, TypeVar
@@ -44,10 +42,7 @@ T = TypeVar("T")
 
 def _get_namespace() -> str:
     """Return the hf_namespace, defaulting to verified username."""
-    namespace = os.environ.get("HF_NAMESPACE")
-    if not namespace:
-        namespace = hf_auth.get_username()
-    return namespace
+    return hf_auth.resolve_namespace()
 
 
 def _log_op(operation: str, **kwargs) -> None:
@@ -82,10 +77,14 @@ def retry_with_backoff(
             return fn()
         except Exception as exc:
             last_exc = exc
+            status_code = _http_status_code(exc)
+            message = str(exc)
             is_transient = (
-                isinstance(exc, urllib.error.HTTPError)
-                and exc.code in (502, 503, 504)
-            ) or "Connection reset" in str(exc)
+                status_code in (502, 503, 504)
+                or "Connection reset" in message
+                or "Read timed out" in message
+                or "Max retries exceeded" in message
+            )
 
             if not is_transient or attempt == max_retries:
                 raise RuntimeError(
@@ -97,6 +96,18 @@ def retry_with_backoff(
             backoff *= 3  # 5 -> 15 -> 45
 
     raise RuntimeError(f"[hf_io] Unexpected retry failure: {last_exc}") from last_exc
+
+
+def _http_status_code(exc: Exception) -> int | None:
+    """Best-effort status extraction across urllib, requests, httpx, and HF Hub errors."""
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    return None
 
 
 # ---------------------------------------------------------------------------

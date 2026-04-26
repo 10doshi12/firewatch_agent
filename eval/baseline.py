@@ -566,7 +566,8 @@ def run_baseline(
 
     # Authenticate
     username = hf_auth.get_username()
-    namespace = config.get("hf_namespace") or username
+    namespace = hf_auth.resolve_namespace(config, username)
+    os.environ["HF_NAMESPACE"] = namespace
 
     local_dir = WORKING_DIR / "eval_run"
     local_dir.mkdir(parents=True, exist_ok=True)

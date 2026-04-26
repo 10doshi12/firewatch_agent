@@ -51,6 +51,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from shared import hf_auth, hf_io  # noqa: E402
 from shared.model_runtime import (  # noqa: E402
+    require_trainable_parameters,
     resolve_base_model_for_inference,
     resolve_optimizer_for_runtime,
     try_import_unsloth,
@@ -107,6 +108,24 @@ def load_config(config_path: Path | None = None) -> dict:
         with open(config_path) as f:
             return yaml.safe_load(f) or {}
     return {}
+
+
+def trl_grpo_config_kwargs(kwargs: dict) -> dict:
+    """Filter GRPOConfig kwargs for the installed TRL version."""
+    import inspect
+
+    from trl import GRPOConfig
+
+    params = inspect.signature(GRPOConfig.__init__).parameters
+    accepted = {k: v for k, v in kwargs.items() if k in params}
+    ignored = sorted(set(kwargs) - set(accepted))
+    if ignored:
+        print(
+            "[grpo] TRL GRPOConfig does not accept: "
+            + ", ".join(ignored)
+            + " (ignored for compatibility)"
+        )
+    return accepted
 
 
 # ---------------------------------------------------------------------------
@@ -259,13 +278,15 @@ def load_llm(
     )
 
     from peft import PeftModel
-    model = PeftModel.from_pretrained(model, str(sft_lora_path))
+    model = PeftModel.from_pretrained(model, str(sft_lora_path), is_trainable=True)
     print(f"[grpo] Applied SFT LoRA from {sft_lora_path}")
 
     if grpo_checkpoint_path and grpo_checkpoint_path.exists():
         try:
             model = PeftModel.from_pretrained(
-                model.base_model.model, str(grpo_checkpoint_path)
+                model.base_model.model,
+                str(grpo_checkpoint_path),
+                is_trainable=True,
             )
             print(f"[grpo] Overlaid GRPO checkpoint from {grpo_checkpoint_path}")
         except Exception as exc:
@@ -280,6 +301,8 @@ def load_llm(
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    require_trainable_parameters(model, "GRPO policy adapter")
 
     return model, tokenizer, True
 
@@ -370,7 +393,11 @@ def create_env_client(config: dict):
     Local:  http://localhost:8000
     Remote: https://10doshi12-firewatch-env.hf.space
     """
-    sim_url = config.get("sim_env_url", "https://10doshi12-firewatch-env.hf.space")
+    sim_url = (
+        os.environ.get("FIREWATCH_SIM_URL")
+        or config.get("sim_env_url")
+        or "https://10doshi12-firewatch-env.hf.space"
+    )
     print(f"[grpo] Connecting to sim at: {sim_url}")
 
     from grpo.sim_client import SimClient
@@ -482,26 +509,26 @@ def run_grpo_training(
         use_low_bit_runtime=use_low_bit_runtime,
     )
 
-    training_args = GRPOConfig(
-        output_dir=str(output_dir),
-        num_generations=num_generations,
-        learning_rate=learning_rate,
-        num_train_epochs=num_train_epochs,
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=grad_accum,
-        max_prompt_length=max_prompt_length,
-        max_completion_length=max_completion_length,
-        max_grad_norm=max_grad_norm,
-        lr_scheduler_type=lr_scheduler,
-        warmup_ratio=warmup_ratio,
-        optim=optimizer_name,
-        logging_steps=1,
-        save_steps=save_steps,
-        save_total_limit=3,
-        report_to="none",
-        bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-        fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
-    )
+    training_args = GRPOConfig(**trl_grpo_config_kwargs({
+        "output_dir": str(output_dir),
+        "num_generations": num_generations,
+        "learning_rate": learning_rate,
+        "num_train_epochs": num_train_epochs,
+        "per_device_train_batch_size": batch_size,
+        "gradient_accumulation_steps": grad_accum,
+        "max_prompt_length": max_prompt_length,
+        "max_completion_length": max_completion_length,
+        "max_grad_norm": max_grad_norm,
+        "lr_scheduler_type": lr_scheduler,
+        "warmup_ratio": warmup_ratio,
+        "optim": optimizer_name,
+        "logging_steps": 1,
+        "save_steps": save_steps,
+        "save_total_limit": 3,
+        "report_to": "none",
+        "bf16": torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+        "fp16": torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
+    }))
 
     # Build training prompts from the dataset
     # Each prompt is a formatted initial observation placeholder
@@ -652,7 +679,8 @@ def run_grpo(config_path: Path | None = None) -> None:
 
     # Authenticate
     username = hf_auth.get_username()
-    namespace = config.get("hf_namespace") or username
+    namespace = hf_auth.resolve_namespace(config, username)
+    os.environ["HF_NAMESPACE"] = namespace
     print(f"[grpo] HF namespace: {namespace}")
 
     local_dir = WORKING_DIR / "grpo_run"

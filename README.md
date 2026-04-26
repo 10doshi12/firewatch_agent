@@ -129,6 +129,11 @@ layout (30 steps, indices 0–29).
 **Unsloth is required** for SFT, GRPO, and `eval.baseline` model loading:
 `pip install unsloth` (or your Colab/git install) in a **CUDA** environment.
 There is no dense-model fallback; `sft.preflight` **fails** if Unsloth cannot import.
+For CUDA 12.1 + torch 2.5 Ampere/HF Space images, the Docker worker uses:
+`pip install "unsloth[cu121-ampere-torch250] @ git+https://github.com/unslothai/unsloth.git"`.
+All Hub entrypoints resolve repos as `config.hf_namespace` → `HF_NAMESPACE` →
+authenticated username, so set `HF_NAMESPACE` when training under an org or
+non-username namespace.
 
 Env vars for long sessions: `MAX_SFT_STEPS` (how many steps per process),
 `SKIP_AUTO_BASELINE=1` to skip post-SFT eval for speed,
