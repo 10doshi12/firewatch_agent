@@ -30,7 +30,7 @@ sft:
     - gate_proj
     - up_proj
     - down_proj
-  llm_epochs_per_batch: 15
+  llm_epochs_per_batch: 5
   per_device_train_batch_size: 1
   gradient_accumulation_steps: 8
   learning_rate: 2.0e-5
@@ -54,7 +54,7 @@ gnn:
   num_layers: 2
   dropout: 0.1
   learning_rate: 1.0e-3
-  max_epochs: 100
+  max_epochs: 250
   patience: 10
   in_channels: 32  # 21 ServiceMetrics + 3 status one-hot + 8 Phase 2/3 fields
 
