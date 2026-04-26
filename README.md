@@ -222,6 +222,25 @@ training pipeline. The two flows do not require each other: you can run
 inference without ever training, and you can train (CPU GNN + SFT)
 without ever running inference.
 
+## Offline analysis
+
+After SFT, inference, or GRPO runs, generate static PNG graphs plus a
+Markdown investigation report:
+
+```bash
+uv run python -m analysis.analyze \
+  --sft-dir ../sft_data/reviewed \
+  --runs-dir runs \
+  --grpo-log auto \
+  --output-dir analysis_runs/latest
+```
+
+Outputs are written under `analysis_runs/latest/` as `report.md`,
+`summary.json`, and `plots/*.png`. GRPO metrics are appended locally after
+each reward evaluation and synced periodically to the dataset repo at
+`grpo/metrics.jsonl`; set `GRPO_METRICS_PATH` to override the local path or
+`GRPO_DATASET_SYNC_EVERY` to adjust the upload interval.
+
 ## Tests
 
 ```bash
