@@ -338,10 +338,11 @@ def _format_rollout_prompt(observation_dict: dict, gnn_blurb: str | None) -> str
     parts.append("")
     sequence_mode = os.environ.get("GRPO_SEQUENCE_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
     if sequence_mode:
+        max_sequence_actions = os.environ.get("GRPO_MAX_SEQUENCE_ACTIONS", "5").strip() or "5"
         parts.append(
             "Return exactly one JSON object and nothing else. Do not include prose, "
             "Markdown, examples, or code fences. The JSON must contain an 'actions' "
-            "array with 2-5 action objects. Each action must have 'action_type', "
+            f"array with 2-{max_sequence_actions} action objects. Each action must have 'action_type', "
             "'target_service' when applicable, and optional 'parameters'. Prefer a "
             "short incident-response sequence: investigate, remediate, then "
             "declare_resolved only after remediation. Use only these common "

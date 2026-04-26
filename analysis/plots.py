@@ -88,20 +88,53 @@ def _bar_plot(
     ylabel: str,
     ylim: tuple[float, float] | None = None,
 ) -> Path:
-    labels = list(values.keys()) or ["none"]
-    counts = [values[key] for key in values] or [0]
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.bar(labels, counts)
+    items = sorted(values.items(), key=lambda item: item[1], reverse=True) if values else [("none", 0)]
+    labels = [_wrap_label(str(label)) for label, _ in items]
+    counts = [count for _, count in items]
+    crowded = len(labels) > 10 or any(len(str(label)) > 18 for label, _ in items)
+
+    if crowded:
+        height = max(6.0, min(18.0, 0.34 * len(labels) + 2.0))
+        fig, ax = plt.subplots(figsize=(11, height))
+        y_values = list(range(len(labels)))
+        ax.barh(y_values, counts)
+        ax.set_yticks(y_values)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.invert_yaxis()
+        ax.set_xlabel(ylabel)
+        ax.set_ylabel(xlabel)
+    else:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.bar(labels, counts)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.tick_params(axis="x", rotation=25)
     ax.set_title(title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
     if ylim is not None:
         ax.set_ylim(*ylim)
-    ax.tick_params(axis="x", rotation=35)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
+
+
+def _wrap_label(label: str, width: int = 24) -> str:
+    if len(label) <= width:
+        return label
+    parts = label.replace("-", "_").split("_")
+    lines: list[str] = []
+    current = ""
+    for part in parts:
+        candidate = part if not current else f"{current}_{part}"
+        if len(candidate) <= width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = part
+    if current:
+        lines.append(current)
+    return "\n".join(lines)
 
 
 def _grouped_count_plot(path: Path, title: str, values: dict) -> Path:

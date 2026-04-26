@@ -281,6 +281,19 @@ def is_grpo_sequence_mode(config: dict | None = None) -> bool:
     return bool(config.get("grpo", {}).get("sequence_mode", False))
 
 
+def should_run_grpo_baseline_phase(phase: str) -> bool:
+    """Whether to run an in-memory GRPO pre/post baseline."""
+    if phase not in {"pre", "post"}:
+        raise ValueError(f"phase must be 'pre' or 'post', got {phase!r}")
+    if _truthy_env("GRPO_SKIP_BASELINE"):
+        return False
+    if phase == "pre" and _truthy_env("GRPO_SKIP_PRE_BASELINE"):
+        return False
+    if phase == "post" and _truthy_env("GRPO_SKIP_POST_BASELINE"):
+        return False
+    return True
+
+
 def eval_action_sequence(
     *,
     env_client,
@@ -901,19 +914,22 @@ def run_grpo_training(
     print(f"[grpo] Starting GRPO training ({len(train_prompts)} prompts, "
           f"{num_generations} generations/group, {num_train_epochs} epochs)")
 
-    try:
-        run_grpo_baseline(
-            namespace=namespace,
-            phase="pre",
-            env_client=env_client,
-            model=model,
-            tokenizer=tokenizer,
-            gnn_model=gnn_model,
-            normalizer=normalizer,
-            config_path=config_path,
-        )
-    except Exception as exc:
-        logger.warning("Pre-GRPO baseline failed: %s", exc)
+    if should_run_grpo_baseline_phase("pre"):
+        try:
+            run_grpo_baseline(
+                namespace=namespace,
+                phase="pre",
+                env_client=env_client,
+                model=model,
+                tokenizer=tokenizer,
+                gnn_model=gnn_model,
+                normalizer=normalizer,
+                config_path=config_path,
+            )
+        except Exception as exc:
+            logger.warning("Pre-GRPO baseline failed: %s", exc)
+    else:
+        print("[grpo] Skipping pre-GRPO baseline (GRPO_SKIP_PRE_BASELINE/GRPO_SKIP_BASELINE)")
 
     if resume_from and resume_from.exists():
         print(f"[grpo] Resuming from checkpoint: {resume_from}")
@@ -924,19 +940,22 @@ def run_grpo_training(
         trainer.train()
     print("[grpo] trainer.train() returned")
 
-    try:
-        run_grpo_baseline(
-            namespace=namespace,
-            phase="post",
-            env_client=env_client,
-            model=model,
-            tokenizer=tokenizer,
-            gnn_model=gnn_model,
-            normalizer=normalizer,
-            config_path=config_path,
-        )
-    except Exception as exc:
-        logger.warning("Post-GRPO baseline failed: %s", exc)
+    if should_run_grpo_baseline_phase("post"):
+        try:
+            run_grpo_baseline(
+                namespace=namespace,
+                phase="post",
+                env_client=env_client,
+                model=model,
+                tokenizer=tokenizer,
+                gnn_model=gnn_model,
+                normalizer=normalizer,
+                config_path=config_path,
+            )
+        except Exception as exc:
+            logger.warning("Post-GRPO baseline failed: %s", exc)
+    else:
+        print("[grpo] Skipping post-GRPO baseline (GRPO_SKIP_POST_BASELINE/GRPO_SKIP_BASELINE)")
 
     # --- Save final model ---
     final_dir = output_dir / "final"

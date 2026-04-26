@@ -44,3 +44,21 @@ def test_unpack_in_memory_components_accepts_grpo_policy_tuple():
     assert baseline._unpack_in_memory_components(
         (model, tokenizer, gnn_model, normalizer)
     ) == (model, tokenizer, gnn_model, normalizer)
+
+
+def test_grpo_pre_baseline_can_be_skipped(monkeypatch):
+    from grpo.train import should_run_grpo_baseline_phase
+
+    monkeypatch.setenv("GRPO_SKIP_PRE_BASELINE", "1")
+
+    assert should_run_grpo_baseline_phase("pre") is False
+    assert should_run_grpo_baseline_phase("post") is True
+
+
+def test_grpo_skip_baseline_disables_both_phases(monkeypatch):
+    from grpo.train import should_run_grpo_baseline_phase
+
+    monkeypatch.setenv("GRPO_SKIP_BASELINE", "true")
+
+    assert should_run_grpo_baseline_phase("pre") is False
+    assert should_run_grpo_baseline_phase("post") is False

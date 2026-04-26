@@ -36,6 +36,7 @@ def test_format_rollout_prompt_sequence_mode_mentions_actions_array(monkeypatch)
     from grpo.rollout import _format_rollout_prompt
 
     monkeypatch.setenv("GRPO_SEQUENCE_MODE", "1")
+    monkeypatch.setenv("GRPO_MAX_SEQUENCE_ACTIONS", "10")
 
     prompt = _format_rollout_prompt(
         {"service_metrics": {"auth-service": {"status": "critical"}}},
@@ -43,7 +44,7 @@ def test_format_rollout_prompt_sequence_mode_mentions_actions_array(monkeypatch)
     )
 
     assert '"actions"' in prompt
-    assert "2-5 action objects" in prompt
+    assert "2-10 action objects" in prompt
 
 
 def test_eval_action_sequence_uses_terminal_episode_score() -> None:

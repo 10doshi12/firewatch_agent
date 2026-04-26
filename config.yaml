@@ -60,7 +60,7 @@ gnn:
 
 grpo:
   sequence_mode: true
-  max_sequence_actions: 5
+  max_sequence_actions: 10
   num_generations: 2
   base_seed: 1000
   # Short full-task sequence run. Increase to 10/50 for longer follow-up runs.
@@ -73,9 +73,9 @@ grpo:
   # action history can be very long, especially after several steps. 10000
   # is well under any TRL/transformers token limit we've hit.
   max_prompt_length: 10000
-  # Enough room for a 2-5 action JSON plan without letting rambling generations
+  # Enough room for a 2-10 action JSON plan without letting rambling generations
   # dominate wall time.
-  max_completion_length: 768
+  max_completion_length: 1536
   max_grad_norm: 0.1
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.1

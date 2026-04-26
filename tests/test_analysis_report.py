@@ -89,6 +89,24 @@ def test_generate_plots_writes_png_files(tmp_path: Path) -> None:
     assert all(path.exists() and path.stat().st_size > 0 for path in plot_paths)
 
 
+def test_bar_plot_uses_tall_layout_for_many_long_labels(tmp_path: Path) -> None:
+    import matplotlib.image as mpimg
+
+    from analysis.plots import _bar_plot
+
+    path = _bar_plot(
+        tmp_path / "many_labels.png",
+        "Many Long Labels",
+        {f"very_long_action_name_{idx}": idx for idx in range(30)},
+        "Action",
+        "Count",
+    )
+
+    image = mpimg.imread(path)
+
+    assert image.shape[0] > image.shape[1]
+
+
 def test_analysis_cli_writes_summary_report_and_plots(tmp_path: Path, monkeypatch) -> None:
     from analysis.analyze import main
 
