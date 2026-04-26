@@ -655,7 +655,7 @@ def run_grpo_training(
     batch_size = grpo_config.get("per_device_train_batch_size", 2)
     grad_accum = grpo_config.get("gradient_accumulation_steps", 4)
     max_prompt_length = grpo_config.get("max_prompt_length", 10000)
-    max_completion_length = grpo_config.get("max_completion_length", 3072)
+    max_completion_length = grpo_config.get("max_completion_length", 1024)
     max_grad_norm = grpo_config.get("max_grad_norm", 0.1)
     lr_scheduler = grpo_config.get("lr_scheduler_type", "cosine")
     warmup_ratio = grpo_config.get("warmup_ratio", 0.1)
@@ -824,9 +824,12 @@ def run_grpo_training(
 
     if resume_from and resume_from.exists():
         print(f"[grpo] Resuming from checkpoint: {resume_from}")
+        print("[grpo] Entering trainer.train()")
         trainer.train(resume_from_checkpoint=str(resume_from))
     else:
+        print("[grpo] Entering trainer.train()")
         trainer.train()
+    print("[grpo] trainer.train() returned")
 
     try:
         run_grpo_baseline(

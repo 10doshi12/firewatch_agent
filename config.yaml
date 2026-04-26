@@ -61,20 +61,20 @@ gnn:
 grpo:
   num_generations: 8
   base_seed: 1000
+  # Fast default for HF Space GRPO iteration. Increase to 50 for a longer final run.
+  prompts_per_difficulty: 10
   learning_rate: 1.0e-5
-  num_train_epochs: 3
+  num_train_epochs: 1
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 4
   # Effectively uncapped on the prompt side. Serialized obs + GNN blurb +
   # action history can be very long, especially after several steps. 10000
   # is well under any TRL/transformers token limit we've hit.
   max_prompt_length: 10000
-  # Effectively uncapped on the completion side. At 256 every completion was
-  # clipped (clipped_ratio == 1.0) and the JSON action got truncated mid-string,
-  # forcing the parser to fall back to declare_resolved on every group. 3072
-  # gives the model enough room to finish on EOS while keeping TRL's generation
-  # buffer bounded.
-  max_completion_length: 3072
+  # Keep this above the old truncating 256-token cap, but below the effectively
+  # uncapped 3072-token setting that can make the first GRPO step appear hung
+  # when the model rambles instead of emitting EOS.
+  max_completion_length: 1024
   max_grad_norm: 0.1
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.1

@@ -53,7 +53,179 @@ CAP_EXHAUST_PENALTY = -5.0
 # Action parsing
 # ---------------------------------------------------------------------------
 
-_ACTION_JSON_RE = re.compile(r'\{[^{}]*"action(?:_type)?"[^{}]*\}')
+_VALID_ACTIONS: frozenset[str] = frozenset({
+    "fetch_logs",
+    "get_metrics_detail",
+    "trace_dependencies",
+    "strace_process",
+    "profiler_dump",
+    "check_gc_pressure",
+    "trace_distributed_request",
+    "inspect_thread_pool",
+    "inspect_commit_diff",
+    "inspect_network_policy",
+    "inspect_quota_usage",
+    "inspect_consensus_state",
+    "inspect_cluster_topology",
+    "restart_service",
+    "rollback_deploy",
+    "revert_config",
+    "scale_replicas",
+    "circuit_break",
+    "traffic_shift",
+    "enable_connection_throttle",
+    "extend_timeout",
+    "optimize_query",
+    "rebalance_load",
+    "adjust_probe_timing",
+    "set_log_level",
+    "disable_retries",
+    "configure_retry_backoff",
+    "rollback_canary",
+    "promote_canary",
+    "redirect_reads_to_primary",
+    "force_replica_resync",
+    "evict_cache_by_pattern",
+    "increase_cache_memory",
+    "complete_traffic_switch",
+    "deregister_stale_instances",
+    "enable_deadline_propagation",
+    "revert_network_policy",
+    "disable_fallback_mode",
+    "request_quota_increase",
+    "force_leader_election",
+    "isolate_minority_nodes",
+    "redirect_config_reads_to_majority",
+    "flush_diverged_keys",
+    "force_cluster_resync",
+    "enable_cache_warming",
+    "rate_limit_cache_misses",
+    "rebalance_az_traffic",
+    "scale_az_capacity",
+    "thread_dump",
+    "inspect_mtls_status",
+    "inspect_pipeline_topology",
+    "inject_missing_env_var",
+    "restart_thread_pool",
+    "update_service_endpoint",
+    "force_ntp_sync",
+    "increase_cpu_limit",
+    "grant_rbac_permission",
+    "increase_max_streams",
+    "rotate_tls_certificate",
+    "rollback_deployment_rollout",
+    "evict_noisy_pod",
+    "pre_warm_service",
+    "stagger_connection_pool_reconnect",
+    "drain_availability_zone",
+    "force_cert_rotation",
+    "restart_pipeline_job",
+    "flush_pipeline_stage",
+    "scale_pipeline_workers",
+    "rollback_proxy_upgrade",
+    "force_complete_proxy_upgrade",
+    "declare_resolved",
+    "escalate",
+})
+
+_ACTION_ALIASES: dict[str, str] = {
+    "collect_logs": "fetch_logs",
+    "query_logs": "fetch_logs",
+    "debug_logs": "fetch_logs",
+    "logs": "fetch_logs",
+    "check_health": "get_metrics_detail",
+    "check_thresholds": "get_metrics_detail",
+    "check_instance_status": "get_metrics_detail",
+    "check_replication_lag": "get_metrics_detail",
+    "performance_profiling": "profiler_dump",
+    "monitor": "get_metrics_detail",
+    "verify_status": "get_metrics_detail",
+    "diagnose": "get_metrics_detail",
+    "redeploy": "rollback_deploy",
+    "rollback_deployment": "rollback_deploy",
+    "rollback": "rollback_deploy",
+    "restart": "restart_service",
+    "scale": "scale_replicas",
+    "resolve": "declare_resolved",
+}
+
+_SERVICE_ALIASES: dict[str, str] = {
+    "user-db-primary": "db-proxy",
+    "user-db-replica": "db-proxy",
+    "user_db_primary": "db-proxy",
+    "user_db_replica": "db-proxy",
+    "database": "db-proxy",
+    "db": "db-proxy",
+}
+
+_CORE_ACTIONS_FOR_PROMPT: tuple[str, ...] = (
+    "fetch_logs",
+    "get_metrics_detail",
+    "trace_dependencies",
+    "restart_service",
+    "rollback_deploy",
+    "revert_config",
+    "scale_replicas",
+    "circuit_break",
+    "traffic_shift",
+    "declare_resolved",
+    "escalate",
+)
+
+
+def _iter_json_candidates(text: str) -> list[str]:
+    """Return balanced JSON object candidates from arbitrary model text."""
+    candidates: list[str] = []
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx in range(start, len(text)):
+            current = text[idx]
+            if escaped:
+                escaped = False
+                continue
+            if current == "\\":
+                escaped = True
+                continue
+            if current == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if current == "{":
+                depth += 1
+            elif current == "}":
+                depth -= 1
+                if depth == 0:
+                    candidates.append(text[start:idx + 1])
+                    break
+    return candidates
+
+
+def _normalize_action(parsed: dict) -> dict | None:
+    action_type = parsed.get("action_type") or parsed.get("action")
+    if not action_type:
+        return None
+
+    normalized = str(action_type).strip().lower()
+    normalized = normalized.replace("-", "_")
+    normalized = _ACTION_ALIASES.get(normalized, normalized)
+    if normalized not in _VALID_ACTIONS:
+        logger.warning("Invalid action_type from completion: %s", action_type)
+        return None
+
+    result = {"action_type": normalized}
+    target = parsed.get("target_service") or parsed.get("service")
+    if isinstance(target, str) and target.strip():
+        raw_target = target.strip()
+        result["target_service"] = _SERVICE_ALIASES.get(raw_target, raw_target)
+    params = parsed.get("parameters") or parsed.get("params")
+    if isinstance(params, dict):
+        result["parameters"] = params
+    return result
 
 
 def _parse_action(completion: str) -> dict:
@@ -66,21 +238,16 @@ def _parse_action(completion: str) -> dict:
     Returns:
         Dict with 'action_type', optional 'target_service', optional 'parameters'.
     """
-    # Try to find JSON-like action in the completion
-    matches = _ACTION_JSON_RE.findall(completion)
-    for match in matches:
+    # Try to find balanced JSON action objects in the completion. Regex failed
+    # on nested "parameters" objects and caused valid actions to fall back to
+    # declare_resolved.
+    for match in _iter_json_candidates(completion):
         try:
             parsed = json.loads(match)
-            action_type = parsed.get("action_type") or parsed.get("action")
-            if action_type:
-                result = {"action_type": action_type}
-                target = parsed.get("target_service") or parsed.get("service")
-                if target:
-                    result["target_service"] = target
-                params = parsed.get("parameters") or parsed.get("params")
-                if params and isinstance(params, dict):
-                    result["parameters"] = params
-                return result
+            if isinstance(parsed, dict):
+                result = _normalize_action(parsed)
+                if result is not None:
+                    return result
         except (json.JSONDecodeError, AttributeError):
             continue
 
@@ -88,15 +255,8 @@ def _parse_action(completion: str) -> dict:
     try:
         parsed = json.loads(completion.strip())
         if isinstance(parsed, dict):
-            action_type = parsed.get("action_type") or parsed.get("action")
-            if action_type:
-                result = {"action_type": action_type}
-                target = parsed.get("target_service") or parsed.get("service")
-                if target:
-                    result["target_service"] = target
-                params = parsed.get("parameters") or parsed.get("params")
-                if params and isinstance(params, dict):
-                    result["parameters"] = params
+            result = _normalize_action(parsed)
+            if result is not None:
                 return result
     except (json.JSONDecodeError, AttributeError):
         pass
@@ -106,16 +266,10 @@ def _parse_action(completion: str) -> dict:
     for match in step_pattern:
         try:
             parsed = json.loads(match)
-            action_type = parsed.get("action_type") or parsed.get("action")
-            if action_type:
-                result = {"action_type": action_type}
-                target = parsed.get("target_service") or parsed.get("service")
-                if target:
-                    result["target_service"] = target
-                params = parsed.get("parameters") or parsed.get("params")
-                if params and isinstance(params, dict):
-                    result["parameters"] = params
-                return result
+            if isinstance(parsed, dict):
+                result = _normalize_action(parsed)
+                if result is not None:
+                    return result
         except (json.JSONDecodeError, AttributeError):
             continue
 
@@ -147,9 +301,16 @@ def _format_rollout_prompt(observation_dict: dict, gnn_blurb: str | None) -> str
 
     parts.append("")
     parts.append(
-        "Analyze the situation and provide the next action to diagnose or resolve "
-        "this incident. Respond with a single JSON action object containing "
-        "'action_type', 'target_service', and optional 'parameters'."
+        "Return exactly one JSON object and nothing else. Do not include prose, "
+        "Markdown, examples, code fences, or multiple actions. The JSON must have "
+        "'action_type', 'target_service', and optional 'parameters'. Use only these "
+        f"common action_type values unless a task-specific metric clearly requires "
+        f"another valid Firewatch action: {', '.join(_CORE_ACTIONS_FOR_PROMPT)}. "
+        "Use fetch_logs instead of collect_logs/query_logs, get_metrics_detail "
+        "instead of check_health/monitor/diagnose, rollback_deploy instead of "
+        "redeploy, restart_service instead of restart, and scale_replicas instead "
+        "of scale. Example format: "
+        '{"action_type":"fetch_logs","target_service":"auth-service"}'
     )
 
     return "\n".join(parts)
@@ -302,10 +463,10 @@ def rollout(
         with torch.no_grad():
             output_ids = model.generate(
                 input_ids,
-                # Effectively uncapped: matches grpo.max_completion_length in
-                # config.yaml. The model is expected to emit EOS well before
-                # this; the cap exists only to bound generation memory.
-                max_new_tokens=3072,
+                # Matches grpo.max_completion_length in config.yaml. This stays
+                # above the old truncating 256-token cap, but below the 3072-token
+                # setting that made rambling generations too slow to iterate.
+                max_new_tokens=1024,
                 do_sample=True,
                 temperature=0.7,
                 top_p=0.9,
