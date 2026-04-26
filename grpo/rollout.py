@@ -278,6 +278,41 @@ def _parse_action(completion: str) -> dict:
     return {"action_type": "declare_resolved"}
 
 
+def parse_action_sequence(completion: str, max_actions: int = 5) -> list[dict]:
+    """Parse a short action sequence from model output.
+
+    Accepts either {"actions": [...]} or a single action object. Invalid actions
+    are skipped; if none remain, falls back to the single-action parser.
+    """
+    for match in _iter_json_candidates(completion):
+        try:
+            parsed = json.loads(match)
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+
+        raw_actions = parsed.get("actions")
+        if isinstance(raw_actions, list):
+            actions: list[dict] = []
+            for raw_action in raw_actions:
+                if not isinstance(raw_action, dict):
+                    continue
+                normalized = _normalize_action(raw_action)
+                if normalized is not None:
+                    actions.append(normalized)
+                if len(actions) >= max_actions:
+                    break
+            if actions:
+                return actions
+
+        normalized = _normalize_action(parsed)
+        if normalized is not None:
+            return [normalized]
+
+    return [_parse_action(completion)]
+
+
 # ---------------------------------------------------------------------------
 # Observation → prompt formatting
 # ---------------------------------------------------------------------------
@@ -300,18 +335,35 @@ def _format_rollout_prompt(observation_dict: dict, gnn_blurb: str | None) -> str
         parts.append(gnn_blurb)
 
     parts.append("")
-    parts.append(
-        "Return exactly one JSON object and nothing else. Do not include prose, "
-        "Markdown, examples, code fences, or multiple actions. The JSON must have "
-        "'action_type', 'target_service', and optional 'parameters'. Use only these "
-        f"common action_type values unless a task-specific metric clearly requires "
-        f"another valid Firewatch action: {', '.join(_CORE_ACTIONS_FOR_PROMPT)}. "
-        "Use fetch_logs instead of collect_logs/query_logs, get_metrics_detail "
-        "instead of check_health/monitor/diagnose, rollback_deploy instead of "
-        "redeploy, restart_service instead of restart, and scale_replicas instead "
-        "of scale. Example format: "
-        '{"action_type":"fetch_logs","target_service":"auth-service"}'
-    )
+    sequence_mode = os.environ.get("GRPO_SEQUENCE_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+    if sequence_mode:
+        parts.append(
+            "Return exactly one JSON object and nothing else. Do not include prose, "
+            "Markdown, examples, or code fences. The JSON must contain an 'actions' "
+            "array with 2-5 action objects. Each action must have 'action_type', "
+            "'target_service' when applicable, and optional 'parameters'. Prefer a "
+            "short incident-response sequence: investigate, remediate, then "
+            "declare_resolved only after remediation. Use only these common "
+            f"action_type values unless a task-specific metric clearly requires "
+            f"another valid Firewatch action: {', '.join(_CORE_ACTIONS_FOR_PROMPT)}. "
+            "Example format: "
+            '{"actions":[{"action_type":"fetch_logs","target_service":"auth-service"},'
+            '{"action_type":"scale_replicas","target_service":"auth-service"},'
+            '{"action_type":"declare_resolved"}]}'
+        )
+    else:
+        parts.append(
+            "Return exactly one JSON object and nothing else. Do not include prose, "
+            "Markdown, examples, code fences, or multiple actions. The JSON must have "
+            "'action_type', 'target_service', and optional 'parameters'. Use only these "
+            f"common action_type values unless a task-specific metric clearly requires "
+            f"another valid Firewatch action: {', '.join(_CORE_ACTIONS_FOR_PROMPT)}. "
+            "Use fetch_logs instead of collect_logs/query_logs, get_metrics_detail "
+            "instead of check_health/monitor/diagnose, rollback_deploy instead of "
+            "redeploy, restart_service instead of restart, and scale_replicas instead "
+            "of scale. Example format: "
+            '{"action_type":"fetch_logs","target_service":"auth-service"}'
+        )
 
     return "\n".join(parts)
 

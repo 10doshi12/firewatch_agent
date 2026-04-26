@@ -18,7 +18,17 @@ def test_write_report_includes_key_sections(tmp_path: Path) -> None:
         summaries={
             "sft": {"example_count": 2},
             "inference": {"episode_count": 3},
-            "grpo": {"reward_eval_count": 4, "mean_reward": 0.25},
+            "grpo": {
+                "reward_eval_count": 4,
+                "mean_reward": 0.25,
+                "positive_reward_rate": 0.5,
+                "action_counts": {"fetch_logs": 3},
+            },
+            "baseline": {
+                "record_count": 2,
+                "grpo_reward_delta": 0.4,
+                "grpo_success_delta": 0.1,
+            },
         },
         plot_paths=[tmp_path / "plots" / "grpo_reward_eval.png"],
     )
@@ -29,6 +39,8 @@ def test_write_report_includes_key_sections(tmp_path: Path) -> None:
     assert "SFT examples analyzed: 2" in content
     assert "Inference episodes analyzed: 3" in content
     assert "GRPO reward evaluations analyzed: 4" in content
+    assert "GRPO pre/post mean reward delta: +0.400" in content
+    assert "`fetch_logs`: 3" in content
     assert "GRPO rewards are single-step evaluations" in content
     assert "plots/grpo_reward_eval.png" in content
 
@@ -69,7 +81,10 @@ def test_generate_plots_writes_png_files(tmp_path: Path) -> None:
         "inference_success_by_difficulty.png",
         "decision_source_mix.png",
         "grpo_reward_eval.png",
+        "grpo_action_distribution.png",
+        "grpo_reward_by_action.png",
         "baseline_progression.png",
+        "grpo_pre_post_delta.png",
     }
     assert all(path.exists() and path.stat().st_size > 0 for path in plot_paths)
 
@@ -103,6 +118,19 @@ def test_analysis_cli_writes_summary_report_and_plots(tmp_path: Path, monkeypatc
 
     grpo_log = tmp_path / "metrics.jsonl"
     grpo_log.write_text(json.dumps({"event": "reward_eval", "reward": 0.5, "action_type": "fetch_logs"}) + "\n")
+    baseline_log = tmp_path / "baselines.jsonl"
+    baseline_log.write_text(
+        json.dumps({
+            "model_variant": "grpo-pre",
+            "overall": {"overall_success_rate": 0.0, "overall_mean_reward": -2.0},
+        })
+        + "\n"
+        + json.dumps({
+            "model_variant": "grpo-post",
+            "overall": {"overall_success_rate": 0.2, "overall_mean_reward": -1.0},
+        })
+        + "\n"
+    )
 
     output_dir = tmp_path / "analysis"
     monkeypatch.setattr(
@@ -116,6 +144,8 @@ def test_analysis_cli_writes_summary_report_and_plots(tmp_path: Path, monkeypatc
             str(tmp_path / "runs"),
             "--grpo-log",
             str(grpo_log),
+            "--baseline-log",
+            str(baseline_log),
             "--output-dir",
             str(output_dir),
         ],
@@ -126,3 +156,4 @@ def test_analysis_cli_writes_summary_report_and_plots(tmp_path: Path, monkeypatc
     assert (output_dir / "summary.json").exists()
     assert (output_dir / "report.md").exists()
     assert (output_dir / "plots" / "grpo_reward_eval.png").exists()
+    assert (output_dir / "plots" / "grpo_pre_post_delta.png").exists()

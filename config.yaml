@@ -59,10 +59,12 @@ gnn:
   in_channels: 32  # 21 ServiceMetrics + 3 status one-hot + 8 Phase 2/3 fields
 
 grpo:
-  num_generations: 8
+  sequence_mode: true
+  max_sequence_actions: 5
+  num_generations: 2
   base_seed: 1000
-  # Fast default for HF Space GRPO iteration. Increase to 50 for a longer final run.
-  prompts_per_difficulty: 10
+  # Short full-task sequence run. Increase to 10/50 for longer follow-up runs.
+  prompts_per_difficulty: 3
   learning_rate: 1.0e-5
   num_train_epochs: 1
   per_device_train_batch_size: 2
@@ -71,10 +73,9 @@ grpo:
   # action history can be very long, especially after several steps. 10000
   # is well under any TRL/transformers token limit we've hit.
   max_prompt_length: 10000
-  # Keep this above the old truncating 256-token cap, but below the effectively
-  # uncapped 3072-token setting that can make the first GRPO step appear hung
-  # when the model rambles instead of emitting EOS.
-  max_completion_length: 1024
+  # Enough room for a 2-5 action JSON plan without letting rambling generations
+  # dominate wall time.
+  max_completion_length: 768
   max_grad_norm: 0.1
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.1

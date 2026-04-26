@@ -272,6 +272,56 @@ def is_grpo_test_run() -> bool:
     return _truthy_env("GRPO_TEST_RUN")
 
 
+def is_grpo_sequence_mode(config: dict | None = None) -> bool:
+    """Whether GRPO reward should evaluate full action sequences."""
+    if _truthy_env("GRPO_SEQUENCE_MODE"):
+        return True
+    if config is None:
+        return False
+    return bool(config.get("grpo", {}).get("sequence_mode", False))
+
+
+def eval_action_sequence(
+    *,
+    env_client,
+    seed: int,
+    difficulty: str,
+    actions: list[dict],
+    max_actions: int,
+) -> float:
+    """Execute a short action sequence and score the full task outcome."""
+    env_client.reset(seed=seed, difficulty=difficulty)
+    cumulative_reward = 0.0
+    seen_investigations: set[tuple[str, str | None]] = set()
+    investigated = False
+
+    for action in actions[:max_actions]:
+        action_type = str(action.get("action_type", ""))
+        target = action.get("target_service")
+        target_key = target if isinstance(target, str) else None
+        result = env_client.step(action)
+        cumulative_reward += float(result.reward) if result.reward is not None else 0.0
+
+        # Hidden shaping only: reward valid compact plans, not oracle answers.
+        cumulative_reward += 0.05
+        if action_type in {"fetch_logs", "get_metrics_detail", "trace_dependencies"}:
+            investigation_key = (action_type, target_key)
+            if investigation_key in seen_investigations:
+                cumulative_reward -= 0.10
+            seen_investigations.add(investigation_key)
+            investigated = True
+        elif investigated and action_type not in {"declare_resolved", "escalate"}:
+            cumulative_reward += 0.15
+
+        if result.done:
+            episode_score = getattr(result.observation, "episode_score", None)
+            if episode_score is not None:
+                return float(episode_score) + cumulative_reward
+            return cumulative_reward
+
+    return cumulative_reward - 1.0
+
+
 def apply_grpo_test_overrides(config: dict, test_run: bool) -> None:
     """Constrain GRPO to a tiny smoke test without changing production config."""
     if not test_run:
@@ -637,6 +687,7 @@ def run_grpo_training(
         _observation_to_dict,
         _parse_action,
         _run_gnn_for_observation,
+        parse_action_sequence,
     )
 
     grpo_config = config.get("grpo", {})
@@ -662,6 +713,13 @@ def run_grpo_training(
     save_steps = grpo_config.get("save_steps", 50)
     max_steps = grpo_config.get("max_steps")
     base_seed = grpo_config.get("base_seed", 1000)
+    sequence_mode = is_grpo_sequence_mode(config)
+    max_sequence_actions = int(os.environ.get(
+        "GRPO_MAX_SEQUENCE_ACTIONS",
+        str(grpo_config.get("max_sequence_actions", 5)),
+    ))
+    if sequence_mode:
+        print(f"[grpo] Sequence mode enabled max_actions={max_sequence_actions}")
 
     # --- Build reward function ---
     # GRPO needs a reward function that takes completions and returns scalars.
@@ -681,6 +739,19 @@ def run_grpo_training(
             logger.warning("Single-step eval failed seed=%d: %s", seed, exc)
             return -1.0
 
+    def _eval_sequence(seed: int, difficulty: str, actions: list[dict]) -> float:
+        try:
+            return eval_action_sequence(
+                env_client=env_client,
+                seed=seed,
+                difficulty=difficulty,
+                actions=actions,
+                max_actions=max_sequence_actions,
+            )
+        except Exception as exc:
+            logger.warning("Sequence eval failed seed=%d difficulty=%s: %s", seed, difficulty, exc)
+            return -2.0
+
     def reward_fn(completions: list[str], **kwargs) -> list[float]:
         """
         Reward function for GRPO.
@@ -692,14 +763,26 @@ def run_grpo_training(
         """
         raw_seeds = kwargs.get("seed", [])
         seeds = [int(s) for s in raw_seeds] if raw_seeds else [base_seed] * len(completions)
+        raw_difficulties = kwargs.get("difficulty", [])
+        difficulties_for_completion = [
+            str(value) for value in raw_difficulties
+        ] if raw_difficulties else ["easy"] * len(completions)
         if len(seeds) != len(completions):
             logger.warning("seeds/completions length mismatch: %d vs %d", len(seeds), len(completions))
 
         rewards: list[float] = []
         for i, completion in enumerate(completions):
             seed = seeds[i] if i < len(seeds) else base_seed
-            action_dict = _parse_action(completion)
-            step_reward = _eval_single_step(seed, action_dict)
+            difficulty = difficulties_for_completion[i] if i < len(difficulties_for_completion) else "easy"
+            if sequence_mode:
+                actions = parse_action_sequence(completion, max_actions=max_sequence_actions)
+                step_reward = _eval_sequence(seed, difficulty, actions)
+                action_dict = actions[0] if actions else {"action_type": "declare_resolved"}
+                action_count = len(actions)
+            else:
+                action_dict = _parse_action(completion)
+                step_reward = _eval_single_step(seed, action_dict)
+                action_count = 1
             rewards.append(step_reward)
 
             print(json.dumps({
@@ -707,6 +790,8 @@ def run_grpo_training(
                 "completion_idx": i,
                 "seed": seed,
                 "action_type": action_dict.get("action_type"),
+                "action_count": action_count,
+                "sequence_mode": sequence_mode,
                 "reward": round(step_reward, 4),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }))
@@ -717,6 +802,8 @@ def run_grpo_training(
                 "seed": seed,
                 "action_type": action_dict.get("action_type"),
                 "target_service": action_dict.get("target_service"),
+                "action_count": action_count,
+                "sequence_mode": sequence_mode,
                 "reward": round(step_reward, 4),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
@@ -765,6 +852,7 @@ def run_grpo_training(
     difficulties = ["easy", "medium", "hard"]
     train_prompts: list[str] = []
     train_seeds: list[int] = []
+    train_difficulties: list[str] = []
     for entry in prompt_dataset:
         seed = entry["seed"]
         difficulty = difficulties[entry["difficulty_idx"]]
@@ -778,8 +866,13 @@ def run_grpo_training(
             prompt = f"Diagnose and resolve the incident for seed {seed}."
         train_prompts.append(prompt)
         train_seeds.append(seed)
+        train_difficulties.append(difficulty)
 
-    train_dataset = Dataset.from_dict({"prompt": train_prompts, "seed": train_seeds})
+    train_dataset = Dataset.from_dict({
+        "prompt": train_prompts,
+        "seed": train_seeds,
+        "difficulty": train_difficulties,
+    })
 
     # --- Create trainer ---
     trainer = GRPOTrainer(

@@ -85,10 +85,17 @@ def summarize_grpo_metrics(records: list[dict]) -> dict:
         if reward is not None
     ]
     action_counts: Counter[str] = Counter()
+    action_rewards: dict[str, list[float]] = defaultdict(list)
+    positive_rewards = 0
     for record in reward_records:
         action_type = record.get("action_type")
         if isinstance(action_type, str) and action_type:
             action_counts[action_type] += 1
+            reward = _float_or_none(record.get("reward"))
+            if reward is not None:
+                action_rewards[action_type].append(reward)
+                if reward > 0:
+                    positive_rewards += 1
 
     return {
         "record_count": len(records),
@@ -96,7 +103,50 @@ def summarize_grpo_metrics(records: list[dict]) -> dict:
         "mean_reward": mean(rewards) if rewards else 0.0,
         "min_reward": min(rewards) if rewards else 0.0,
         "max_reward": max(rewards) if rewards else 0.0,
+        "positive_reward_rate": positive_rewards / len(rewards) if rewards else 0.0,
         "action_counts": dict(action_counts),
+        "mean_reward_by_action": {
+            action: mean(values)
+            for action, values in sorted(action_rewards.items())
+            if values
+        },
+    }
+
+
+def summarize_baselines(records: list[dict]) -> dict:
+    """Summarize baseline progression, especially GRPO pre/post delta."""
+    variants: dict[str, dict] = {}
+    for record in records:
+        variant = record.get("model_variant")
+        if isinstance(variant, str) and variant:
+            variants[variant] = record
+
+    pre = variants.get("grpo-pre")
+    post = variants.get("grpo-post")
+    pre_overall = pre.get("overall", {}) if isinstance(pre, dict) else {}
+    post_overall = post.get("overall", {}) if isinstance(post, dict) else {}
+    pre_reward = _float_or_none(pre_overall.get("overall_mean_reward"))
+    post_reward = _float_or_none(post_overall.get("overall_mean_reward"))
+    pre_success = _float_or_none(pre_overall.get("overall_success_rate"))
+    post_success = _float_or_none(post_overall.get("overall_success_rate"))
+
+    return {
+        "record_count": len(records),
+        "variants": sorted(variants),
+        "grpo_pre_mean_reward": pre_reward,
+        "grpo_post_mean_reward": post_reward,
+        "grpo_reward_delta": (
+            post_reward - pre_reward
+            if pre_reward is not None and post_reward is not None
+            else None
+        ),
+        "grpo_pre_success_rate": pre_success,
+        "grpo_post_success_rate": post_success,
+        "grpo_success_delta": (
+            post_success - pre_success
+            if pre_success is not None and post_success is not None
+            else None
+        ),
     }
 
 

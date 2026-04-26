@@ -67,12 +67,16 @@ def generate_plots(
             "Count",
         ),
         _grpo_reward_plot(plots_dir / "grpo_reward_eval.png", grpo_records),
+        _grpo_action_plot(plots_dir / "grpo_action_distribution.png", grpo_records),
+        _grpo_reward_by_action_plot(plots_dir / "grpo_reward_by_action.png", grpo_records),
     ]
 
     if baseline_records:
         paths.append(_baseline_plot(plots_dir / "baseline_progression.png", baseline_records))
+        paths.append(_baseline_delta_plot(plots_dir / "grpo_pre_post_delta.png", baseline_records))
     else:
         paths.append(_placeholder_plot(plots_dir / "baseline_progression.png", "No baseline records"))
+        paths.append(_placeholder_plot(plots_dir / "grpo_pre_post_delta.png", "No GRPO pre/post baseline"))
     return paths
 
 
@@ -130,6 +134,35 @@ def _grpo_reward_plot(path: Path, records: list[dict]) -> Path:
     return path
 
 
+def _grpo_action_plot(path: Path, records: list[dict]) -> Path:
+    counts: dict[str, int] = {}
+    for record in records:
+        if record.get("event") != "reward_eval":
+            continue
+        action = record.get("action_type")
+        if isinstance(action, str) and action:
+            counts[action] = counts.get(action, 0) + 1
+    return _bar_plot(path, "GRPO Action Distribution", counts, "Action", "Count")
+
+
+def _grpo_reward_by_action_plot(path: Path, records: list[dict]) -> Path:
+    buckets: dict[str, list[float]] = {}
+    for record in records:
+        if record.get("event") != "reward_eval":
+            continue
+        action = record.get("action_type")
+        reward = record.get("reward")
+        if isinstance(action, str) and isinstance(reward, (int, float)):
+            buckets.setdefault(action, []).append(float(reward))
+
+    values = {
+        action: sum(rewards) / len(rewards)
+        for action, rewards in buckets.items()
+        if rewards
+    }
+    return _bar_plot(path, "GRPO Mean Reward by Action", values, "Action", "Mean Reward")
+
+
 def _baseline_plot(path: Path, records: list[dict]) -> Path:
     labels = [str(record.get("trigger", index))[:20] for index, record in enumerate(records)]
     success = [
@@ -152,6 +185,44 @@ def _baseline_plot(path: Path, records: list[dict]) -> Path:
     ax2.plot(x_values, rewards, marker="s", label="mean reward")
     ax2.set_ylabel("Mean Reward")
     ax1.set_title("Baseline Progression")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
+def _baseline_delta_plot(path: Path, records: list[dict]) -> Path:
+    by_variant = {
+        str(record.get("model_variant")): record
+        for record in records
+        if record.get("model_variant")
+    }
+    pre = by_variant.get("grpo-pre")
+    post = by_variant.get("grpo-post")
+    if not pre or not post:
+        return _placeholder_plot(path, "Missing GRPO pre/post baseline")
+
+    metrics = {
+        "success_rate": (
+            float(pre.get("overall", {}).get("overall_success_rate", 0.0)),
+            float(post.get("overall", {}).get("overall_success_rate", 0.0)),
+        ),
+        "mean_reward": (
+            float(pre.get("overall", {}).get("overall_mean_reward", 0.0)),
+            float(post.get("overall", {}).get("overall_mean_reward", 0.0)),
+        ),
+    }
+
+    labels = list(metrics)
+    x_values = list(range(len(labels)))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar([x - width / 2 for x in x_values], [metrics[label][0] for label in labels], width, label="pre")
+    ax.bar([x + width / 2 for x in x_values], [metrics[label][1] for label in labels], width, label="post")
+    ax.set_title("GRPO Pre/Post Baseline Delta")
+    ax.set_xticks(x_values)
+    ax.set_xticklabels(labels)
+    ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)

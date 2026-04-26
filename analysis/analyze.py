@@ -15,6 +15,7 @@ from analysis.loaders import (
 from analysis.plots import generate_plots
 from analysis.report import write_report
 from analysis.summaries import (
+    summarize_baselines,
     summarize_grpo_metrics,
     summarize_inference_runs,
     summarize_sft_examples,
@@ -26,7 +27,7 @@ def main() -> None:
     parser.add_argument("--sft-dir", type=Path, default=Path("../sft_data/reviewed"))
     parser.add_argument("--runs-dir", type=Path, default=Path("runs"))
     parser.add_argument("--grpo-log", default="auto")
-    parser.add_argument("--baseline-log", type=Path, default=None)
+    parser.add_argument("--baseline-log", default="auto")
     parser.add_argument("--output-dir", type=Path, default=Path("analysis_runs/latest"))
     args = parser.parse_args()
 
@@ -37,12 +38,14 @@ def main() -> None:
     inference_runs = load_inference_runs(args.runs_dir)
     grpo_log = _resolve_grpo_log(args.grpo_log)
     grpo_records = load_grpo_metrics(grpo_log) if grpo_log else []
-    baseline_records = load_jsonl(args.baseline_log) if args.baseline_log else []
+    baseline_log = _resolve_baseline_log(args.baseline_log)
+    baseline_records = load_jsonl(baseline_log) if baseline_log else []
 
     summaries = {
         "sft": summarize_sft_examples(sft_examples),
         "inference": summarize_inference_runs(inference_runs),
         "grpo": summarize_grpo_metrics(grpo_records),
+        "baseline": summarize_baselines(baseline_records),
     }
 
     plot_paths = generate_plots(
@@ -63,7 +66,7 @@ def main() -> None:
                     "sft_dir": str(args.sft_dir),
                     "runs_dir": str(args.runs_dir),
                     "grpo_log": str(grpo_log) if grpo_log else None,
-                    "baseline_log": str(args.baseline_log) if args.baseline_log else None,
+                    "baseline_log": str(baseline_log) if baseline_log else None,
                 },
                 "plots": [str(path) for path in plot_paths],
                 "report": str(report_path),
@@ -87,6 +90,28 @@ def _resolve_grpo_log(value: str) -> Path | None:
     except Exception:
         return None
     return CHECKPOINTS_DIR / "grpo" / "metrics.jsonl"
+
+
+def _resolve_baseline_log(value: str) -> Path | None:
+    if value == "none":
+        return None
+    if value != "auto":
+        return Path(value)
+
+    candidates: list[Path] = []
+    try:
+        from shared.platform import WORKING_DIR
+        candidates.append(WORKING_DIR / "eval_run" / "baselines" / "metrics.jsonl")
+    except Exception:
+        pass
+    candidates.extend([
+        Path("eval_run/baselines/metrics.jsonl"),
+        Path("/tmp/firewatch_agent/eval_run/baselines/metrics.jsonl"),
+    ])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0] if candidates else None
 
 
 if __name__ == "__main__":
