@@ -13,13 +13,21 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 
-def test_parse_grpo_step_variant_for_in_memory_baseline():
+def test_parse_grpo_pre_post_variants_for_in_memory_baseline():
     from eval import baseline
 
-    parsed = baseline._parse_variant("grpo-step-10")
+    parsed = baseline._parse_variant("grpo-pre")
 
-    assert parsed["type"] == "grpo-step"
-    assert parsed["checkpoint_num"] == 10
+    assert parsed["type"] == "grpo-pre"
+    assert parsed["checkpoint_num"] is None
+    assert parsed["use_gnn"] is True
+    assert parsed["lora_repo_suffix"] is None
+    assert parsed["lora_subfolder"] is None
+
+    parsed = baseline._parse_variant("grpo-post")
+
+    assert parsed["type"] == "grpo-post"
+    assert parsed["checkpoint_num"] is None
     assert parsed["use_gnn"] is True
     assert parsed["lora_repo_suffix"] is None
     assert parsed["lora_subfolder"] is None

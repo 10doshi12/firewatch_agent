@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -131,6 +132,13 @@ class _AsyncSimClient:
                 self._ws_url,
                 open_timeout=self._connect_timeout,
                 max_size=100 * 1024 * 1024,  # 100MB
+                # Keep the connection alive across long-running GRPO steps.
+                # Our client loop now runs in a daemon thread (see SimClient
+                # below), so it can pong server keepalive pings autonomously.
+                # 60s ping interval + 120s pong timeout tolerates a single
+                # ~70s training step without triggering a 1011 close.
+                ping_interval=60,
+                ping_timeout=120,
             )
             logger.info("Connected to sim at %s", self._ws_url)
         except Exception as exc:
@@ -266,17 +274,52 @@ class SimClient:
             retry_backoff=retry_backoff,
         )
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._started = threading.Event()
+        self._closed = False
 
-    def _get_loop(self) -> asyncio.AbstractEventLoop:
-        """Get or create event loop for sync execution."""
-        if self._loop is None or self._loop.is_closed():
-            self._loop = asyncio.new_event_loop()
+    def _ensure_loop_thread(self) -> asyncio.AbstractEventLoop:
+        """Start the asyncio loop in a daemon thread if needed.
+
+        GRPO can spend 60-90s in GPU generation/training between simulator
+        calls. A background loop keeps WebSocket keepalive pongs flowing during
+        that blocked period, avoiding server-side 1011 ping timeouts.
+        """
+        if self._loop is not None and self._thread is not None and self._thread.is_alive():
+            return self._loop
+
+        self._started.clear()
+
+        def run_loop() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+            self._started.set()
+            loop.run_forever()
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+
+        self._thread = threading.Thread(
+            target=run_loop,
+            name="firewatch-sim-ws-loop",
+            daemon=True,
+        )
+        self._thread.start()
+        if not self._started.wait(timeout=5.0) or self._loop is None:
+            raise RuntimeError("Timed out starting simulator WebSocket event loop")
         return self._loop
 
     def _run(self, coro):
-        """Run an async coroutine synchronously."""
-        loop = self._get_loop()
-        return loop.run_until_complete(coro)
+        """Run an async coroutine on the background event loop synchronously."""
+        if self._closed:
+            self._closed = False
+        loop = self._ensure_loop_thread()
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result()
 
     def connect(self) -> None:
         """Establish WebSocket connection."""
@@ -284,10 +327,19 @@ class SimClient:
 
     def disconnect(self) -> None:
         """Close the WebSocket connection."""
-        self._run(self._async_client.disconnect())
-        if self._loop and not self._loop.is_closed():
-            self._loop.close()
+        if self._loop is None:
+            return
+        try:
+            self._run(self._async_client.disconnect())
+        finally:
+            loop = self._loop
+            thread = self._thread
             self._loop = None
+            self._thread = None
+            self._closed = True
+            loop.call_soon_threadsafe(loop.stop)
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=5.0)
 
     def reset(self, seed: int, difficulty: str = "easy") -> StepResult:
         """Reset the sim (synchronous)."""

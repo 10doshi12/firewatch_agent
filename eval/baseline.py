@@ -91,7 +91,6 @@ def _load_config(config_path: Path | None = None) -> dict:
 
 _SFT_BATCH_RE = re.compile(r"^sft-batch-(\d+)$")
 _GRPO_CHECKPOINT_RE = re.compile(r"^grpo-checkpoint-(\d+)$")
-_GRPO_STEP_RE = re.compile(r"^grpo-step-(\d+)$")
 
 
 def _parse_variant(variant: str) -> dict:
@@ -121,6 +120,18 @@ def _parse_variant(variant: str) -> dict:
         # Used once at step 0 before any SFT to anchor the baseline-progression chart.
         return {
             "type": "untrained",
+            "batch_num": None,
+            "checkpoint_num": None,
+            "use_gnn": True,
+            "lora_repo_suffix": None,
+            "lora_subfolder": None,
+        }
+
+    if variant in {"grpo-pre", "grpo-post"}:
+        # Auto-invoked by GRPO training around the full run. The model is
+        # provided in-memory, so no LoRA artifact path is needed here.
+        return {
+            "type": variant,
             "batch_num": None,
             "checkpoint_num": None,
             "use_gnn": True,
@@ -162,18 +173,6 @@ def _parse_variant(variant: str) -> dict:
             "lora_subfolder": f"checkpoint-{checkpoint_num}",
         }
 
-    m = _GRPO_STEP_RE.match(variant)
-    if m:
-        checkpoint_num = int(m.group(1))
-        return {
-            "type": "grpo-step",
-            "batch_num": None,
-            "checkpoint_num": checkpoint_num,
-            "use_gnn": True,
-            "lora_repo_suffix": None,
-            "lora_subfolder": None,
-        }
-
     if variant == "grpo-latest":
         return {
             "type": "grpo-latest",
@@ -186,7 +185,8 @@ def _parse_variant(variant: str) -> dict:
 
     raise ValueError(
         f"Unknown model_variant '{variant}'. "
-        f"Expected: base, sft-batch-<N>, sft-latest, grpo-checkpoint-<N>, grpo-latest"
+        "Expected: base, untrained, sft-batch-<N>, sft-latest, "
+        "grpo-checkpoint-<N>, grpo-latest, grpo-pre, grpo-post"
     )
 
 

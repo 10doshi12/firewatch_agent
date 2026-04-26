@@ -302,7 +302,10 @@ def rollout(
         with torch.no_grad():
             output_ids = model.generate(
                 input_ids,
-                max_new_tokens=256,
+                # Effectively uncapped: matches grpo.max_completion_length in
+                # config.yaml. The model is expected to emit EOS well before
+                # this; the cap exists only to bound generation memory.
+                max_new_tokens=3072,
                 do_sample=True,
                 temperature=0.7,
                 top_p=0.9,

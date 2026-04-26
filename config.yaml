@@ -65,8 +65,16 @@ grpo:
   num_train_epochs: 3
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 4
-  max_prompt_length: 2048
-  max_completion_length: 256
+  # Effectively uncapped on the prompt side. Serialized obs + GNN blurb +
+  # action history can be very long, especially after several steps. 10000
+  # is well under any TRL/transformers token limit we've hit.
+  max_prompt_length: 10000
+  # Effectively uncapped on the completion side. At 256 every completion was
+  # clipped (clipped_ratio == 1.0) and the JSON action got truncated mid-string,
+  # forcing the parser to fall back to declare_resolved on every group. 3072
+  # gives the model enough room to finish on EOS while keeping TRL's generation
+  # buffer bounded.
+  max_completion_length: 3072
   max_grad_norm: 0.1
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.1

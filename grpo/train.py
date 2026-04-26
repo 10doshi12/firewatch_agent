@@ -158,21 +158,10 @@ def _grpo_metrics_sync_enabled() -> bool:
     return os.environ.get("GRPO_DISABLE_DATASET_SYNC") != "1"
 
 
-def _grpo_baseline_every_steps(config: dict) -> int:
-    raw = os.environ.get("GRPO_BASELINE_EVERY_STEPS")
-    if raw is None or not raw.strip():
-        raw = str(config.get("grpo", {}).get("baseline_every_steps", 0))
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"[grpo] GRPO_BASELINE_EVERY_STEPS must be an integer, got {raw!r}") from exc
-    return max(0, value)
-
-
-def run_post_grpo_baseline(
+def run_grpo_baseline(
     *,
     namespace: str,
-    step: int,
+    phase: str,
     env_client,
     model,
     tokenizer,
@@ -180,8 +169,11 @@ def run_post_grpo_baseline(
     normalizer,
     config_path: Path | None,
 ) -> None:
-    """Evaluate the in-memory GRPO policy and append the baseline row to HF."""
-    print(f"[grpo] Running post-GRPO baseline at step {step} for namespace {namespace}")
+    """Evaluate the in-memory GRPO policy before or after the full training run."""
+    if phase not in {"pre", "post"}:
+        raise ValueError(f"phase must be 'pre' or 'post', got {phase!r}")
+
+    print(f"[grpo] Running {phase}-GRPO baseline for namespace {namespace}")
     print("[grpo] Temporarily disconnecting training sim client for baseline")
     env_client.disconnect()
     release_wait = float(os.environ.get("GRPO_BASELINE_SESSION_RELEASE_SECONDS", "1.0"))
@@ -190,8 +182,8 @@ def run_post_grpo_baseline(
     model.eval()
     try:
         run_baseline(
-            model_variant=f"grpo-step-{step}",
-            trigger=f"post_grpo_step_{step}",
+            model_variant=f"grpo-{phase}",
+            trigger=f"{phase}_grpo_full_run",
             auto_triggered=True,
             model_in_memory=(model, tokenizer, gnn_model, normalizer),
             config_path=config_path,
@@ -297,8 +289,12 @@ def apply_grpo_test_overrides(config: dict, test_run: bool) -> None:
         grpo_config["num_generations"],
     )
     grpo_config["gradient_accumulation_steps"] = 1
-    grpo_config["max_prompt_length"] = int(os.environ.get("GRPO_TEST_MAX_PROMPT_LENGTH", "1024"))
-    grpo_config["max_completion_length"] = int(os.environ.get("GRPO_TEST_MAX_COMPLETION_LENGTH", "128"))
+    # 1024/128 was too tight: smoke runs were truncating the JSON action mid-string,
+    # so the reward function got "declare_resolved" fallbacks instead of real actions.
+    # We now mirror the full-run "effectively uncapped" caps (4096/1024) so smoke
+    # tests are representative of production behaviour.
+    grpo_config["max_prompt_length"] = int(os.environ.get("GRPO_TEST_MAX_PROMPT_LENGTH", "4096"))
+    grpo_config["max_completion_length"] = int(os.environ.get("GRPO_TEST_MAX_COMPLETION_LENGTH", "1024"))
     grpo_config["save_steps"] = int(os.environ.get("GRPO_TEST_SAVE_STEPS", "1"))
     grpo_config["max_steps"] = int(os.environ.get("GRPO_TEST_MAX_STEPS", "1"))
 
@@ -652,17 +648,14 @@ def run_grpo_training(
         sync_every=_grpo_metrics_sync_every(config),
         sync_enabled=_grpo_metrics_sync_enabled(),
     )
-    baseline_every_steps = _grpo_baseline_every_steps(config)
-    if baseline_every_steps > 0:
-        print(f"[grpo] Post-GRPO baseline enabled every {baseline_every_steps} optimizer step(s)")
 
     num_generations = grpo_config.get("num_generations", 8)
     learning_rate = grpo_config.get("learning_rate", 1e-5)
     num_train_epochs = grpo_config.get("num_train_epochs", 3)
     batch_size = grpo_config.get("per_device_train_batch_size", 2)
     grad_accum = grpo_config.get("gradient_accumulation_steps", 4)
-    max_prompt_length = grpo_config.get("max_prompt_length", 1024)
-    max_completion_length = grpo_config.get("max_completion_length", 256)
+    max_prompt_length = grpo_config.get("max_prompt_length", 10000)
+    max_completion_length = grpo_config.get("max_completion_length", 3072)
     max_grad_norm = grpo_config.get("max_grad_norm", 0.1)
     lr_scheduler = grpo_config.get("lr_scheduler_type", "cosine")
     warmup_ratio = grpo_config.get("warmup_ratio", 0.1)
@@ -811,45 +804,43 @@ def run_grpo_training(
 
     trainer.add_callback(CheckpointPushCallback())
 
-    class BaselineEvalCallback(TrainerCallback):
-        """Run a lightweight baseline eval on the in-memory policy."""
-
-        def __init__(self) -> None:
-            self.completed_steps: set[int] = set()
-
-        def on_step_end(self, args, state, control, **cb_kwargs):
-            step = int(state.global_step or 0)
-            if baseline_every_steps <= 0 or step <= 0:
-                return
-            if step % baseline_every_steps != 0 or step in self.completed_steps:
-                return
-            self.completed_steps.add(step)
-            try:
-                run_post_grpo_baseline(
-                    namespace=namespace,
-                    step=step,
-                    env_client=env_client,
-                    model=model,
-                    tokenizer=tokenizer,
-                    gnn_model=gnn_model,
-                    normalizer=normalizer,
-                    config_path=config_path,
-                )
-            except Exception as exc:
-                logger.warning("Post-GRPO baseline failed at step %d: %s", step, exc)
-
-    if baseline_every_steps > 0:
-        trainer.add_callback(BaselineEvalCallback())
-
     # --- Train ---
     print(f"[grpo] Starting GRPO training ({len(train_prompts)} prompts, "
           f"{num_generations} generations/group, {num_train_epochs} epochs)")
+
+    try:
+        run_grpo_baseline(
+            namespace=namespace,
+            phase="pre",
+            env_client=env_client,
+            model=model,
+            tokenizer=tokenizer,
+            gnn_model=gnn_model,
+            normalizer=normalizer,
+            config_path=config_path,
+        )
+    except Exception as exc:
+        logger.warning("Pre-GRPO baseline failed: %s", exc)
 
     if resume_from and resume_from.exists():
         print(f"[grpo] Resuming from checkpoint: {resume_from}")
         trainer.train(resume_from_checkpoint=str(resume_from))
     else:
         trainer.train()
+
+    try:
+        run_grpo_baseline(
+            namespace=namespace,
+            phase="post",
+            env_client=env_client,
+            model=model,
+            tokenizer=tokenizer,
+            gnn_model=gnn_model,
+            normalizer=normalizer,
+            config_path=config_path,
+        )
+    except Exception as exc:
+        logger.warning("Post-GRPO baseline failed: %s", exc)
 
     # --- Save final model ---
     final_dir = output_dir / "final"

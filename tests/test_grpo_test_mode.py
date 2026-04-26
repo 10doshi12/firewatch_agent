@@ -89,8 +89,8 @@ def test_apply_grpo_test_overrides_isolates_training_shape(monkeypatch):
     assert config["grpo"]["num_train_epochs"] == 1
     assert config["grpo"]["per_device_train_batch_size"] == 2
     assert config["grpo"]["gradient_accumulation_steps"] == 1
-    assert config["grpo"]["max_prompt_length"] == 1024
-    assert config["grpo"]["max_completion_length"] == 128
+    assert config["grpo"]["max_prompt_length"] == 4096
+    assert config["grpo"]["max_completion_length"] == 1024
     assert config["grpo"]["max_steps"] == 1
     assert original["grpo"]["num_generations"] == 8
 
@@ -191,7 +191,7 @@ def test_grpo_metrics_writer_sync_final_ignores_upload_failure(monkeypatch, tmp_
     assert (tmp_path / "metrics.jsonl").exists()
 
 
-def test_run_post_grpo_baseline_uses_in_memory_policy(monkeypatch):
+def test_run_grpo_baseline_uses_in_memory_policy(monkeypatch):
     from grpo import train
 
     class DummyModel:
@@ -226,9 +226,9 @@ def test_run_post_grpo_baseline_uses_in_memory_policy(monkeypatch):
 
     monkeypatch.setattr(train, "run_baseline", fake_run_baseline)
 
-    train.run_post_grpo_baseline(
+    train.run_grpo_baseline(
         namespace="test-ns",
-        step=10,
+        phase="post",
         env_client=env_client,
         model=model,
         tokenizer=tokenizer,
@@ -238,8 +238,8 @@ def test_run_post_grpo_baseline_uses_in_memory_policy(monkeypatch):
     )
 
     assert baseline_calls == [{
-        "model_variant": "grpo-step-10",
-        "trigger": "post_grpo_step_10",
+        "model_variant": "grpo-post",
+        "trigger": "post_grpo_full_run",
         "auto_triggered": True,
         "model_in_memory": (model, tokenizer, gnn_model, normalizer),
         "config_path": None,
@@ -248,9 +248,36 @@ def test_run_post_grpo_baseline_uses_in_memory_policy(monkeypatch):
     assert model.calls == ["eval", "train"]
 
 
-def test_grpo_baseline_interval_uses_env_before_config(monkeypatch):
+def test_run_grpo_baseline_supports_pre_phase(monkeypatch):
     from grpo import train
 
-    monkeypatch.setenv("GRPO_BASELINE_EVERY_STEPS", "10")
+    class DummyModel:
+        def eval(self) -> None:
+            pass
 
-    assert train._grpo_baseline_every_steps({"grpo": {"baseline_every_steps": 50}}) == 10
+        def train(self) -> None:
+            pass
+
+    class DummyEnvClient:
+        def disconnect(self) -> None:
+            pass
+
+        def connect(self) -> None:
+            pass
+
+    baseline_calls: list[dict] = []
+    monkeypatch.setattr(train, "run_baseline", lambda **kwargs: baseline_calls.append(kwargs))
+
+    train.run_grpo_baseline(
+        namespace="test-ns",
+        phase="pre",
+        env_client=DummyEnvClient(),
+        model=DummyModel(),
+        tokenizer=object(),
+        gnn_model=object(),
+        normalizer=object(),
+        config_path=None,
+    )
+
+    assert baseline_calls[0]["model_variant"] == "grpo-pre"
+    assert baseline_calls[0]["trigger"] == "pre_grpo_full_run"
