@@ -30,6 +30,13 @@ def write_report(output_dir: Path | str, summaries: dict, plot_paths: list[Path]
         f"- GRPO positive reward rate: {grpo.get('positive_reward_rate', 0.0):.2f}",
         f"- Baseline records analyzed: {baseline.get('record_count', 0)}",
     ]
+    if grpo.get("group_count"):
+        lines.extend([
+            f"- GRPO rollout batches: {grpo.get('group_count', 0)}",
+            f"- GRPO mean within-batch reward σ: {float(grpo.get('mean_within_batch_std', 0.0)):.3f}",
+            f"- GRPO batches with σ>0: {100.0 * float(grpo.get('pct_batches_with_positive_std', 0.0)):.0f}%",
+            f"- GRPO mean valid-action rate / batch: {100.0 * float(grpo.get('mean_valid_action_rate', 0.0)):.0f}%",
+        ])
     if reward_delta is not None:
         lines.append(f"- GRPO pre/post mean reward delta: {reward_delta:+.3f}")
     if success_delta is not None:

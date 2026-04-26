@@ -83,6 +83,7 @@ def test_generate_plots_writes_png_files(tmp_path: Path) -> None:
         "grpo_reward_eval.png",
         "grpo_action_distribution.png",
         "grpo_reward_by_action.png",
+        "grpo_batch_learnability.png",
         "baseline_progression.png",
         "grpo_pre_post_delta.png",
     }

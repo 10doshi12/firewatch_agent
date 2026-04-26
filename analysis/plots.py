@@ -69,6 +69,7 @@ def generate_plots(
         _grpo_reward_plot(plots_dir / "grpo_reward_eval.png", grpo_records),
         _grpo_action_plot(plots_dir / "grpo_action_distribution.png", grpo_records),
         _grpo_reward_by_action_plot(plots_dir / "grpo_reward_by_action.png", grpo_records),
+        _grpo_batch_learnability_plot(plots_dir / "grpo_batch_learnability.png", grpo_records),
     ]
 
     if baseline_records:
@@ -194,6 +195,82 @@ def _grpo_reward_by_action_plot(path: Path, records: list[dict]) -> Path:
         if rewards
     }
     return _bar_plot(path, "GRPO Mean Reward by Action", values, "Action", "Mean Reward")
+
+
+def _grpo_batch_learnability_plot(path: Path, records: list[dict]) -> Path:
+    """
+    Show whether GRPO has the *precondition* for learning: reward spread inside each
+    TRL rollout batch, plus valid Firewatch action names (same normalization as training).
+    """
+    import statistics
+
+    from analysis.grpo_group_metrics import (
+        action_type_is_valid_firewatch,
+        grpo_complete_group_cut_indices,
+        group_reward_eval_records,
+        summarize_grpo_group_batches,
+    )
+
+    groups = group_reward_eval_records(records)
+    if len(groups) < 2:
+        return _placeholder_plot(path, "Not enough GRPO batches for learnability plot")
+
+    stds: list[float] = []
+    valids: list[float] = []
+    for batch in groups:
+        rewards = [
+            float(row["reward"])
+            for row in batch
+            if isinstance(row.get("reward"), (int, float))
+        ]
+        stds.append(statistics.pstdev(rewards) if len(rewards) > 1 else 0.0)
+        denom = len(batch) or 1
+        valids.append(
+            sum(1 for row in batch if action_type_is_valid_firewatch(row.get("action_type"))) / denom
+        )
+
+    xs = list(range(1, len(groups) + 1))
+    roll_std = [_window_mean(stds, index, window=3) for index in range(len(stds))]
+    roll_valid = [_window_mean(valids, index, window=3) for index in range(len(valids))]
+
+    stats = summarize_grpo_group_batches(records)
+    footer = (
+        f"Across {stats.get('group_count', 0)} batches: "
+        f"mean σ={stats.get('mean_within_batch_std', 0.0):.3f}, "
+        f"{100.0 * float(stats.get('pct_batches_with_positive_std', 0.0)):.0f}% batches with σ>0, "
+        f"mean valid-action rate={100.0 * float(stats.get('mean_valid_action_rate', 0.0)):.0f}%"
+    )
+    if int(stats.get("sequence_group_count", 0) or 0) > 0:
+        footer += (
+            f" | sequence-mode batches: "
+            f"mean σ={float(stats.get('sequence_mean_within_batch_std', 0.0)):.3f}, "
+            f"valid={100.0 * float(stats.get('sequence_mean_valid_action_rate', 0.0)):.0f}%"
+        )
+
+    fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(11, 7.2), sharex=True)
+    ax0.bar(xs, stds, color="#4C72B0", alpha=0.35, label="within-batch reward σ")
+    ax0.plot(xs, roll_std, color="#DD8452", linewidth=2.4, label="rolling mean σ (window=3)")
+    for cut in grpo_complete_group_cut_indices(records):
+        if 0 < cut < len(groups):
+            ax0.axvline(cut + 0.5, color="#333333", linestyle="--", linewidth=1.0, alpha=0.55)
+    ax0.set_ylabel("Reward σ inside batch")
+    ax0.set_title("GRPO learnability: reward spread per rollout batch (GRPO needs σ > 0)")
+    ax0.legend(loc="upper right", fontsize=9)
+    ax0.grid(True, axis="y", alpha=0.3)
+
+    ax1.plot(xs, valids, marker="o", markersize=4, color="#55A868", linewidth=1, label="valid Firewatch verb rate")
+    ax1.plot(xs, roll_valid, color="#C44E52", linewidth=2.4, label="rolling mean rate (window=3)")
+    ax1.set_ylim(-0.05, 1.05)
+    ax1.set_ylabel("Valid action rate")
+    ax1.set_xlabel("Rollout batch index (chronological)")
+    ax1.legend(loc="lower right", fontsize=9)
+    ax1.grid(True, axis="y", alpha=0.3)
+
+    fig.text(0.5, 0.02, footer, ha="center", va="bottom", fontsize=9)
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
 
 
 def _baseline_plot(path: Path, records: list[dict]) -> Path:

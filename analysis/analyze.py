@@ -14,6 +14,7 @@ from analysis.loaders import (
 )
 from analysis.plots import generate_plots
 from analysis.report import write_report
+from analysis.grpo_group_metrics import summarize_grpo_group_batches
 from analysis.summaries import (
     summarize_baselines,
     summarize_grpo_metrics,
@@ -41,10 +42,12 @@ def main() -> None:
     baseline_log = _resolve_baseline_log(args.baseline_log)
     baseline_records = load_jsonl(baseline_log) if baseline_log else []
 
+    grpo_summary = summarize_grpo_metrics(grpo_records)
+    grpo_summary.update(summarize_grpo_group_batches(grpo_records))
     summaries = {
         "sft": summarize_sft_examples(sft_examples),
         "inference": summarize_inference_runs(inference_runs),
-        "grpo": summarize_grpo_metrics(grpo_records),
+        "grpo": grpo_summary,
         "baseline": summarize_baselines(baseline_records),
     }
 
