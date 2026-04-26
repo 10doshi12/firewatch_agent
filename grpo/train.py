@@ -173,6 +173,7 @@ def run_post_grpo_baseline(
     *,
     namespace: str,
     step: int,
+    env_client,
     model,
     tokenizer,
     gnn_model,
@@ -181,6 +182,11 @@ def run_post_grpo_baseline(
 ) -> None:
     """Evaluate the in-memory GRPO policy and append the baseline row to HF."""
     print(f"[grpo] Running post-GRPO baseline at step {step} for namespace {namespace}")
+    print("[grpo] Temporarily disconnecting training sim client for baseline")
+    env_client.disconnect()
+    release_wait = float(os.environ.get("GRPO_BASELINE_SESSION_RELEASE_SECONDS", "1.0"))
+    if release_wait > 0:
+        time.sleep(release_wait)
     model.eval()
     try:
         run_baseline(
@@ -192,6 +198,8 @@ def run_post_grpo_baseline(
         )
     finally:
         model.train()
+        print("[grpo] Reconnecting training sim client after baseline")
+        env_client.connect()
 
 
 def _load_dotenv() -> None:
@@ -820,6 +828,7 @@ def run_grpo_training(
                 run_post_grpo_baseline(
                     namespace=namespace,
                     step=step,
+                    env_client=env_client,
                     model=model,
                     tokenizer=tokenizer,
                     gnn_model=gnn_model,

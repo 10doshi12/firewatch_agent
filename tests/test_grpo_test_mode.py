@@ -204,7 +204,18 @@ def test_run_post_grpo_baseline_uses_in_memory_policy(monkeypatch):
         def train(self) -> None:
             self.calls.append("train")
 
+    class DummyEnvClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def disconnect(self) -> None:
+            self.calls.append("disconnect")
+
+        def connect(self) -> None:
+            self.calls.append("connect")
+
     model = DummyModel()
+    env_client = DummyEnvClient()
     tokenizer = object()
     gnn_model = object()
     normalizer = object()
@@ -218,6 +229,7 @@ def test_run_post_grpo_baseline_uses_in_memory_policy(monkeypatch):
     train.run_post_grpo_baseline(
         namespace="test-ns",
         step=10,
+        env_client=env_client,
         model=model,
         tokenizer=tokenizer,
         gnn_model=gnn_model,
@@ -232,6 +244,7 @@ def test_run_post_grpo_baseline_uses_in_memory_policy(monkeypatch):
         "model_in_memory": (model, tokenizer, gnn_model, normalizer),
         "config_path": None,
     }]
+    assert env_client.calls == ["disconnect", "connect"]
     assert model.calls == ["eval", "train"]
 
 
