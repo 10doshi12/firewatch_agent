@@ -17,6 +17,7 @@ Push functions:
   push_sft_lora(batch_num, local_dir)
   push_gnn_checkpoint(batch_num, local_file)
   append_and_push_baselines_log(repo_id, new_line_path, local_dir)
+  append_and_push_dataset_jsonl(repo_id, remote_path, local_file, local_dir, commit_message)
 
 Utility:
   retry_with_backoff(fn, max_retries, initial_backoff) -> T
@@ -414,3 +415,81 @@ def append_and_push_baselines_log(
     size_bytes = merged_path.stat().st_size
     _log_op("append_and_push_baselines_log", repo_id=repo_id,
             local_path=str(merged_path), size_bytes=size_bytes, elapsed_s=round(elapsed, 2))
+
+
+def append_and_push_dataset_jsonl(
+    repo_id: str,
+    remote_path: str,
+    local_file: Path,
+    local_dir: Path,
+    commit_message: str,
+) -> None:
+    """
+    Merge a local JSONL file into a dataset repo JSONL path and upload it.
+
+    Repeated syncs are expected during long training runs, so exact duplicate
+    lines are removed while preserving first-seen order.
+    """
+    local_file = Path(local_file)
+    local_dir = Path(local_dir)
+    remote_path = remote_path.strip("/")
+    merged_path = local_dir / remote_path
+    merged_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_content = ""
+
+    def _download():
+        return snapshot_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            allow_patterns=[remote_path],
+            local_dir=local_dir,
+            token=hf_auth.get_token(),
+        )
+
+    try:
+        repo_dir = retry_with_backoff(_download)
+        existing_path = local_dir / remote_path
+        if not existing_path.exists():
+            candidates = list(Path(repo_dir).rglob(Path(remote_path).name))
+            if candidates:
+                existing_path = candidates[0]
+        if existing_path.exists():
+            existing_content = existing_path.read_text()
+    except Exception as exc:
+        if "404" not in str(exc) and "not found" not in str(exc).lower():
+            raise
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    for content in (existing_content, local_file.read_text()):
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped and stripped not in seen:
+                seen.add(stripped)
+                lines.append(stripped)
+    merged_path.write_text("\n".join(lines) + ("\n" if lines else ""))
+
+    start = time.monotonic()
+
+    def _upload():
+        api = HfApi(token=hf_auth.get_token())
+        api.upload_file(
+            path_or_fileobj=str(merged_path),
+            path_in_repo=remote_path,
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message=commit_message,
+        )
+
+    retry_with_backoff(_upload)
+    elapsed = time.monotonic() - start
+    size_bytes = merged_path.stat().st_size
+    _log_op(
+        "append_and_push_dataset_jsonl",
+        repo_id=repo_id,
+        filename=remote_path,
+        local_path=str(merged_path),
+        size_bytes=size_bytes,
+        elapsed_s=round(elapsed, 2),
+    )

@@ -75,9 +75,86 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
+GRPO_METRICS_REMOTE_PATH = "grpo/metrics.jsonl"
+
 # ---------------------------------------------------------------------------
 # .env loader
 # ---------------------------------------------------------------------------
+
+
+class GrpoMetricsWriter:
+    """Append GRPO metrics locally and periodically sync them to the dataset repo."""
+
+    def __init__(
+        self,
+        metrics_path: Path,
+        namespace: str,
+        sync_every: int = 100,
+        sync_enabled: bool = True,
+    ) -> None:
+        self.metrics_path = Path(metrics_path)
+        self.namespace = namespace
+        self.sync_every = max(1, int(sync_every))
+        self.sync_enabled = sync_enabled
+        self.records_since_sync = 0
+        self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def repo_id(self) -> str:
+        return f"{self.namespace}/firewatch-sft-data"
+
+    @property
+    def sync_dir(self) -> Path:
+        return self.metrics_path.parent / "_dataset_sync"
+
+    def append(self, record: dict) -> None:
+        with self.metrics_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        self.records_since_sync += 1
+        if self.sync_enabled and self.records_since_sync >= self.sync_every:
+            self._sync("Periodic GRPO metrics sync")
+
+    def sync_final(self) -> None:
+        if self.sync_enabled:
+            self._sync("Final GRPO metrics sync")
+
+    def _sync(self, commit_message: str) -> None:
+        try:
+            hf_io.append_and_push_dataset_jsonl(
+                repo_id=self.repo_id,
+                remote_path=GRPO_METRICS_REMOTE_PATH,
+                local_file=self.metrics_path,
+                local_dir=self.sync_dir,
+                commit_message=commit_message,
+            )
+            self.records_since_sync = 0
+        except Exception as exc:
+            logger.warning("GRPO metrics dataset sync failed: %s", exc)
+
+
+def _grpo_metrics_path() -> Path:
+    override = os.environ.get("GRPO_METRICS_PATH")
+    if override:
+        return Path(override)
+    return CHECKPOINTS_DIR / "grpo" / "metrics.jsonl"
+
+
+def _grpo_metrics_sync_every(config: dict) -> int:
+    override = os.environ.get("GRPO_DATASET_SYNC_EVERY")
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            logger.warning("Invalid GRPO_DATASET_SYNC_EVERY=%r; using config/default", override)
+    return int(config.get("grpo", {}).get("dataset_sync_every", 100))
+
+
+def _grpo_metrics_sync_enabled() -> bool:
+    return os.environ.get("GRPO_DISABLE_DATASET_SYNC") != "1"
 
 
 def _load_dotenv() -> None:
@@ -516,6 +593,12 @@ def run_grpo_training(
     grpo_config = config.get("grpo", {})
     output_dir = CHECKPOINTS_DIR / "grpo"
     output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_writer = GrpoMetricsWriter(
+        metrics_path=_grpo_metrics_path(),
+        namespace=namespace,
+        sync_every=_grpo_metrics_sync_every(config),
+        sync_enabled=_grpo_metrics_sync_enabled(),
+    )
 
     num_generations = grpo_config.get("num_generations", 8)
     learning_rate = grpo_config.get("learning_rate", 1e-5)
@@ -578,6 +661,16 @@ def run_grpo_training(
                 "reward": round(step_reward, 4),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }))
+            metrics_writer.append({
+                "event": "reward_eval",
+                "evaluation_scope": "single_step",
+                "completion_idx": i,
+                "seed": seed,
+                "action_type": action_dict.get("action_type"),
+                "target_service": action_dict.get("target_service"),
+                "reward": round(step_reward, 4),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
 
         return rewards
 
@@ -833,6 +926,14 @@ def run_grpo(config_path: Path | None = None, test_run: bool = False) -> None:
     }
     print(f"\n[grpo] === Complete ===")
     print(json.dumps(summary, indent=2))
+    metrics_writer = GrpoMetricsWriter(
+        metrics_path=_grpo_metrics_path(),
+        namespace=namespace,
+        sync_every=_grpo_metrics_sync_every(config),
+        sync_enabled=_grpo_metrics_sync_enabled(),
+    )
+    metrics_writer.append(summary)
+    metrics_writer.sync_final()
 
 
 # ---------------------------------------------------------------------------

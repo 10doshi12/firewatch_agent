@@ -116,3 +116,52 @@ def test_push_grpo_checkpoint_uses_test_prefix(monkeypatch, tmp_path):
         exist_ok=True,
         private=False,
     )
+
+
+def test_grpo_metrics_writer_appends_and_syncs_on_interval(monkeypatch, tmp_path):
+    from grpo import train
+
+    sync_calls: list[tuple[str, str, Path]] = []
+
+    def fake_sync(repo_id: str, remote_path: str, local_file: Path, local_dir: Path, commit_message: str) -> None:
+        sync_calls.append((repo_id, remote_path, local_file))
+
+    monkeypatch.setattr(train.hf_io, "append_and_push_dataset_jsonl", fake_sync)
+
+    metrics_path = tmp_path / "grpo" / "metrics.jsonl"
+    writer = train.GrpoMetricsWriter(
+        metrics_path=metrics_path,
+        namespace="test-ns",
+        sync_every=2,
+        sync_enabled=True,
+    )
+
+    writer.append({"event": "reward_eval", "reward": 0.5})
+    assert sync_calls == []
+
+    writer.append({"event": "reward_eval", "reward": -0.5})
+    records = metrics_path.read_text().strip().splitlines()
+
+    assert len(records) == 2
+    assert sync_calls == [("test-ns/firewatch-sft-data", "grpo/metrics.jsonl", metrics_path)]
+
+
+def test_grpo_metrics_writer_sync_final_ignores_upload_failure(monkeypatch, tmp_path):
+    from grpo import train
+
+    def fake_sync(*args, **kwargs) -> None:
+        raise RuntimeError("temporary hub outage")
+
+    monkeypatch.setattr(train.hf_io, "append_and_push_dataset_jsonl", fake_sync)
+
+    writer = train.GrpoMetricsWriter(
+        metrics_path=tmp_path / "metrics.jsonl",
+        namespace="test-ns",
+        sync_every=1,
+        sync_enabled=True,
+    )
+    writer.append({"event": "grpo_complete", "wall_time_seconds": 1.0})
+
+    writer.sync_final()
+
+    assert (tmp_path / "metrics.jsonl").exists()

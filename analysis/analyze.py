@@ -1,0 +1,93 @@
+"""CLI for generating Firewatch analysis graphs and report."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from analysis.loaders import (
+    load_grpo_metrics,
+    load_inference_runs,
+    load_jsonl,
+    load_sft_examples,
+)
+from analysis.plots import generate_plots
+from analysis.report import write_report
+from analysis.summaries import (
+    summarize_grpo_metrics,
+    summarize_inference_runs,
+    summarize_sft_examples,
+)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate Firewatch analysis report")
+    parser.add_argument("--sft-dir", type=Path, default=Path("../sft_data/reviewed"))
+    parser.add_argument("--runs-dir", type=Path, default=Path("runs"))
+    parser.add_argument("--grpo-log", default="auto")
+    parser.add_argument("--baseline-log", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=Path("analysis_runs/latest"))
+    args = parser.parse_args()
+
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    sft_examples = load_sft_examples(args.sft_dir)
+    inference_runs = load_inference_runs(args.runs_dir)
+    grpo_log = _resolve_grpo_log(args.grpo_log)
+    grpo_records = load_grpo_metrics(grpo_log) if grpo_log else []
+    baseline_records = load_jsonl(args.baseline_log) if args.baseline_log else []
+
+    summaries = {
+        "sft": summarize_sft_examples(sft_examples),
+        "inference": summarize_inference_runs(inference_runs),
+        "grpo": summarize_grpo_metrics(grpo_records),
+    }
+
+    plot_paths = generate_plots(
+        output_dir=output_dir,
+        sft_summary=summaries["sft"],
+        inference_summary=summaries["inference"],
+        grpo_records=grpo_records,
+        baseline_records=baseline_records,
+    )
+    report_path = write_report(output_dir, summaries, plot_paths)
+
+    summary_path = output_dir / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "summaries": summaries,
+                "inputs": {
+                    "sft_dir": str(args.sft_dir),
+                    "runs_dir": str(args.runs_dir),
+                    "grpo_log": str(grpo_log) if grpo_log else None,
+                    "baseline_log": str(args.baseline_log) if args.baseline_log else None,
+                },
+                "plots": [str(path) for path in plot_paths],
+                "report": str(report_path),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    print(f"[analysis] Wrote report: {report_path}")
+    print(f"[analysis] Wrote summary: {summary_path}")
+
+
+def _resolve_grpo_log(value: str) -> Path | None:
+    if value == "none":
+        return None
+    if value != "auto":
+        return Path(value)
+    try:
+        from shared.platform import CHECKPOINTS_DIR
+    except Exception:
+        return None
+    return CHECKPOINTS_DIR / "grpo" / "metrics.jsonl"
+
+
+if __name__ == "__main__":
+    main()
