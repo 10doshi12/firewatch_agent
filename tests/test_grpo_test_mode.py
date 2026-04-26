@@ -87,12 +87,36 @@ def test_apply_grpo_test_overrides_isolates_training_shape(monkeypatch):
 
     assert config["grpo"]["num_generations"] == 2
     assert config["grpo"]["num_train_epochs"] == 1
-    assert config["grpo"]["per_device_train_batch_size"] == 1
+    assert config["grpo"]["per_device_train_batch_size"] == 2
     assert config["grpo"]["gradient_accumulation_steps"] == 1
     assert config["grpo"]["max_prompt_length"] == 1024
     assert config["grpo"]["max_completion_length"] == 128
     assert config["grpo"]["max_steps"] == 1
     assert original["grpo"]["num_generations"] == 8
+
+
+def test_grpo_test_overrides_create_valid_trl_batch_shape(monkeypatch):
+    from grpo import train
+    from trl import GRPOConfig
+
+    config = {"grpo": {}}
+    monkeypatch.setenv("GRPO_TEST_RUN", "1")
+
+    train.apply_grpo_test_overrides(config, test_run=True)
+    grpo_config = config["grpo"]
+
+    args = GRPOConfig(
+        output_dir="/tmp/firewatch-grpo-test",
+        num_generations=grpo_config["num_generations"],
+        per_device_train_batch_size=grpo_config["per_device_train_batch_size"],
+        gradient_accumulation_steps=grpo_config["gradient_accumulation_steps"],
+        max_steps=grpo_config["max_steps"],
+        report_to="none",
+        bf16=False,
+        fp16=False,
+    )
+
+    assert args.generation_batch_size % args.num_generations == 0
 
 
 def test_push_grpo_checkpoint_uses_test_prefix(monkeypatch, tmp_path):
@@ -165,3 +189,55 @@ def test_grpo_metrics_writer_sync_final_ignores_upload_failure(monkeypatch, tmp_
     writer.sync_final()
 
     assert (tmp_path / "metrics.jsonl").exists()
+
+
+def test_run_post_grpo_baseline_uses_in_memory_policy(monkeypatch):
+    from grpo import train
+
+    class DummyModel:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def eval(self) -> None:
+            self.calls.append("eval")
+
+        def train(self) -> None:
+            self.calls.append("train")
+
+    model = DummyModel()
+    tokenizer = object()
+    gnn_model = object()
+    normalizer = object()
+    baseline_calls: list[dict] = []
+
+    def fake_run_baseline(**kwargs) -> None:
+        baseline_calls.append(kwargs)
+
+    monkeypatch.setattr(train, "run_baseline", fake_run_baseline)
+
+    train.run_post_grpo_baseline(
+        namespace="test-ns",
+        step=10,
+        model=model,
+        tokenizer=tokenizer,
+        gnn_model=gnn_model,
+        normalizer=normalizer,
+        config_path=None,
+    )
+
+    assert baseline_calls == [{
+        "model_variant": "grpo-step-10",
+        "trigger": "post_grpo_step_10",
+        "auto_triggered": True,
+        "model_in_memory": (model, tokenizer, gnn_model, normalizer),
+        "config_path": None,
+    }]
+    assert model.calls == ["eval", "train"]
+
+
+def test_grpo_baseline_interval_uses_env_before_config(monkeypatch):
+    from grpo import train
+
+    monkeypatch.setenv("GRPO_BASELINE_EVERY_STEPS", "10")
+
+    assert train._grpo_baseline_every_steps({"grpo": {"baseline_every_steps": 50}}) == 10

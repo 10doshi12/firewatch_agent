@@ -91,6 +91,7 @@ def _load_config(config_path: Path | None = None) -> dict:
 
 _SFT_BATCH_RE = re.compile(r"^sft-batch-(\d+)$")
 _GRPO_CHECKPOINT_RE = re.compile(r"^grpo-checkpoint-(\d+)$")
+_GRPO_STEP_RE = re.compile(r"^grpo-step-(\d+)$")
 
 
 def _parse_variant(variant: str) -> dict:
@@ -161,6 +162,18 @@ def _parse_variant(variant: str) -> dict:
             "lora_subfolder": f"checkpoint-{checkpoint_num}",
         }
 
+    m = _GRPO_STEP_RE.match(variant)
+    if m:
+        checkpoint_num = int(m.group(1))
+        return {
+            "type": "grpo-step",
+            "batch_num": None,
+            "checkpoint_num": checkpoint_num,
+            "use_gnn": True,
+            "lora_repo_suffix": None,
+            "lora_subfolder": None,
+        }
+
     if variant == "grpo-latest":
         return {
             "type": "grpo-latest",
@@ -175,6 +188,16 @@ def _parse_variant(variant: str) -> dict:
         f"Unknown model_variant '{variant}'. "
         f"Expected: base, sft-batch-<N>, sft-latest, grpo-checkpoint-<N>, grpo-latest"
     )
+
+
+def _unpack_in_memory_components(model_in_memory: object) -> tuple[object, object | None, object | None, object | None]:
+    """Accept SFT's (model, tokenizer) and GRPO's (model, tokenizer, gnn, normalizer)."""
+    if isinstance(model_in_memory, tuple):
+        if len(model_in_memory) >= 4:
+            return model_in_memory[0], model_in_memory[1], model_in_memory[2], model_in_memory[3]
+        if len(model_in_memory) >= 2:
+            return model_in_memory[0], model_in_memory[1], None, None
+    return model_in_memory, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -586,13 +609,19 @@ def run_baseline(
             model_variant, trigger,
         )
 
-        # Extract model and tokenizer from the in-memory object
-        # The model_in_memory is expected to be a tuple (model, tokenizer)
-        # or a model with a .tokenizer attribute, depending on SPEC-T2's implementation.
-        if isinstance(model_in_memory, tuple) and len(model_in_memory) >= 2:
-            model, tokenizer = model_in_memory[0], model_in_memory[1]
-        else:
-            model = model_in_memory
+        # The model_in_memory object can be SFT's (model, tokenizer) tuple or
+        # GRPO's (model, tokenizer, gnn_model, normalizer) tuple. The latter
+        # avoids loading a second 14B model while GRPO already owns the GPU.
+        model, tokenizer, provided_gnn_model, provided_normalizer = _unpack_in_memory_components(model_in_memory)
+        if provided_gnn_model is not None:
+            gnn_model = provided_gnn_model
+            gnn_checkpoint_filename = "in_memory"
+            if hasattr(gnn_model, "eval"):
+                gnn_model.eval()
+        if provided_normalizer is not None:
+            normalizer = provided_normalizer
+
+        if tokenizer is None:
             # Try to get tokenizer from model
             if hasattr(model, "tokenizer"):
                 tokenizer = model.tokenizer
