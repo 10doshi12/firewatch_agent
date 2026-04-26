@@ -36,6 +36,7 @@ from pathlib import Path
 
 import torch
 import yaml
+from huggingface_hub import HfApi
 
 # ---------------------------------------------------------------------------
 # Resolve project paths
@@ -133,16 +134,59 @@ def trl_grpo_config_kwargs(kwargs: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _truthy_env(name: str) -> bool:
+    """Return True for common enabled env-var spellings."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _optional_positive_int_env(name: str) -> int | None:
+    """Parse an optional positive integer environment variable."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"[grpo] {name} must be an integer, got {raw!r}") from exc
+    if value < 0:
+        raise RuntimeError(f"[grpo] {name} must be >= 0, got {value}")
+    return value
+
+
+def is_grpo_test_run() -> bool:
+    """Whether this invocation should run the one-prompt smoke test path."""
+    return _truthy_env("GRPO_TEST_RUN")
+
+
+def apply_grpo_test_overrides(config: dict, test_run: bool) -> None:
+    """Constrain GRPO to a tiny smoke test without changing production config."""
+    if not test_run:
+        return
+
+    grpo_config = config.setdefault("grpo", {})
+    grpo_config["num_generations"] = int(os.environ.get("GRPO_TEST_NUM_GENERATIONS", "2"))
+    grpo_config["num_train_epochs"] = 1
+    grpo_config["per_device_train_batch_size"] = 1
+    grpo_config["gradient_accumulation_steps"] = 1
+    grpo_config["max_prompt_length"] = int(os.environ.get("GRPO_TEST_MAX_PROMPT_LENGTH", "1024"))
+    grpo_config["max_completion_length"] = int(os.environ.get("GRPO_TEST_MAX_COMPLETION_LENGTH", "128"))
+    grpo_config["save_steps"] = int(os.environ.get("GRPO_TEST_SAVE_STEPS", "1"))
+    grpo_config["max_steps"] = int(os.environ.get("GRPO_TEST_MAX_STEPS", "1"))
+
+
 def pull_sft_lora(namespace: str, local_dir: Path) -> Path:
     """Pull the locked SFT LoRA adapter from latest/."""
     model_repo = f"{namespace}/firewatch-agent-sft"
-    adapter_path = hf_io.pull_lora_adapter(model_repo, "latest", local_dir)
+    sft_batch = _optional_positive_int_env("GRPO_SFT_BATCH")
+    subfolder = f"batch_{sft_batch:03d}" if sft_batch is not None else "latest"
+
+    adapter_path = hf_io.pull_lora_adapter(model_repo, subfolder, local_dir)
     if adapter_path is None:
         raise RuntimeError(
-            f"[grpo] SFT LoRA not found at {model_repo}/latest/. "
-            "GRPO requires a completed SFT phase (Module 2). Aborting."
+            f"[grpo] SFT LoRA not found at {model_repo}/{subfolder}/. "
+            "Set GRPO_SFT_BATCH to a known good batch or publish latest/. Aborting."
         )
-    print(f"[grpo] Pulled SFT LoRA from {model_repo}/latest/")
+    print(f"[grpo] Pulled SFT LoRA from {model_repo}/{subfolder}/")
     return adapter_path
 
 
@@ -152,10 +196,27 @@ def pull_gnn_latest(namespace: str, local_dir: Path) -> tuple[Path, Path]:
 
     Scans the GNN repo for the highest-numbered batch checkpoint.
     """
-    from huggingface_hub import HfApi
+    gnn_repo = f"{namespace}/firewatch-gnn"
+    explicit_batch = _optional_positive_int_env("GRPO_GNN_BATCH")
+
+    if explicit_batch is not None:
+        # pull_gnn_checkpoint expects batch_num + 1 (it downloads batch_{N-1})
+        gnn_path = hf_io.pull_gnn_checkpoint(explicit_batch + 1, local_dir)
+        if gnn_path is None:
+            raise RuntimeError(f"[grpo] Failed to download GNN batch_{explicit_batch:03d}.pt")
+
+        norm_path = local_dir / "gnn" / "normalization.json"
+        if not norm_path.exists():
+            candidates = list(local_dir.rglob("normalization.json"))
+            if candidates:
+                norm_path = candidates[0]
+            else:
+                raise RuntimeError("[grpo] normalization.json not found alongside GNN checkpoint")
+
+        print(f"[grpo] Pulled pinned GNN checkpoint batch_{explicit_batch:03d} + normalization")
+        return gnn_path, norm_path
 
     api = HfApi(token=hf_auth.get_token())
-    gnn_repo = f"{namespace}/firewatch-gnn"
 
     try:
         files = api.list_repo_files(gnn_repo, repo_type="model")
@@ -228,7 +289,9 @@ def pull_state(
     # Check FORCE_FRESH_GRPO before pulling GRPO checkpoint
     force_fresh = os.environ.get("FORCE_FRESH_GRPO", "0") == "1"
     grpo_path = None
-    if not force_fresh:
+    if is_grpo_test_run():
+        print("[grpo] GRPO_TEST_RUN=1 — skipping GRPO checkpoint resume")
+    elif not force_fresh:
         grpo_path = pull_grpo_checkpoint(namespace, local_dir)
     else:
         print("[grpo] FORCE_FRESH_GRPO=1 — skipping GRPO checkpoint resume")
@@ -355,6 +418,22 @@ def build_prompt_dataset(config: dict) -> list[dict]:
     Seeds are drawn starting from grpo.base_seed (default 1000) and filtered
     to exclude the evaluator's grader seeds {42, 137, 256}.
     """
+    if is_grpo_test_run():
+        difficulty_names = {"easy": 0, "medium": 1, "hard": 2}
+        difficulty = os.environ.get("GRPO_TEST_DIFFICULTY", "easy").strip().lower()
+        if difficulty not in difficulty_names:
+            raise RuntimeError(
+                "[grpo] GRPO_TEST_DIFFICULTY must be one of easy, medium, hard"
+            )
+        seed = int(os.environ.get("GRPO_TEST_SEED", "1000"))
+        dataset = [{
+            "seed": seed,
+            "difficulty_idx": difficulty_names[difficulty],
+            "prompt_idx": 0,
+        }]
+        print(f"[grpo] Built GRPO test prompt dataset: {len(dataset)} entry")
+        return dataset
+
     grpo_config = config.get("grpo", {})
     base_seed = grpo_config.get("base_seed", 1000)
     prompts_per_difficulty = grpo_config.get("prompts_per_difficulty", 50)
@@ -449,6 +528,7 @@ def run_grpo_training(
     lr_scheduler = grpo_config.get("lr_scheduler_type", "cosine")
     warmup_ratio = grpo_config.get("warmup_ratio", 0.1)
     save_steps = grpo_config.get("save_steps", 50)
+    max_steps = grpo_config.get("max_steps")
     base_seed = grpo_config.get("base_seed", 1000)
 
     # --- Build reward function ---
@@ -509,7 +589,7 @@ def run_grpo_training(
         use_low_bit_runtime=use_low_bit_runtime,
     )
 
-    training_args = GRPOConfig(**trl_grpo_config_kwargs({
+    grpo_kwargs = {
         "output_dir": str(output_dir),
         "num_generations": num_generations,
         "learning_rate": learning_rate,
@@ -528,7 +608,11 @@ def run_grpo_training(
         "report_to": "none",
         "bf16": torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         "fp16": torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
-    }))
+    }
+    if max_steps is not None:
+        grpo_kwargs["max_steps"] = max_steps
+
+    training_args = GRPOConfig(**trl_grpo_config_kwargs(grpo_kwargs))
 
     # Build training prompts from the dataset
     # Each prompt is a formatted initial observation placeholder
@@ -608,9 +692,8 @@ def _push_grpo_checkpoint(namespace: str, step: int, local_dir: Path) -> None:
     repo_id = f"{namespace}/firewatch-agent-grpo"
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    from huggingface_hub import HfApi
-
     api = HfApi(token=hf_auth.get_token())
+    prefix = "test/" if is_grpo_test_run() else ""
 
     # Ensure repo exists
     try:
@@ -624,10 +707,10 @@ def _push_grpo_checkpoint(namespace: str, step: int, local_dir: Path) -> None:
             folder_path=str(local_dir),
             repo_id=repo_id,
             repo_type="model",
-            path_in_repo=f"checkpoint-{step}/",
+            path_in_repo=f"{prefix}checkpoint-{step}/",
             commit_message=f"GRPO checkpoint step {step} @ {ts}",
         ))
-        print(f"[grpo] Pushed checkpoint-{step}/ to {repo_id}")
+        print(f"[grpo] Pushed {prefix}checkpoint-{step}/ to {repo_id}")
     except Exception as exc:
         logger.warning("Failed to push checkpoint-%d: %s", step, exc)
 
@@ -637,10 +720,10 @@ def _push_grpo_checkpoint(namespace: str, step: int, local_dir: Path) -> None:
             folder_path=str(local_dir),
             repo_id=repo_id,
             repo_type="model",
-            path_in_repo="latest/",
+            path_in_repo=f"{prefix}latest/",
             commit_message=f"GRPO latest (step {step}) @ {ts}",
         ))
-        print(f"[grpo] Pushed latest/ to {repo_id}")
+        print(f"[grpo] Pushed {prefix}latest/ to {repo_id}")
     except Exception as exc:
         logger.warning("Failed to push latest/: %s", exc)
 
@@ -656,7 +739,7 @@ def push_final_checkpoint(namespace: str, final_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_grpo(config_path: Path | None = None) -> None:
+def run_grpo(config_path: Path | None = None, test_run: bool = False) -> None:
     """
     Run the full GRPO training pipeline.
 
@@ -668,6 +751,10 @@ def run_grpo(config_path: Path | None = None) -> None:
     _load_dotenv()
 
     config = load_config(config_path)
+    if test_run:
+        os.environ["GRPO_TEST_RUN"] = "1"
+    test_run_enabled = is_grpo_test_run()
+    apply_grpo_test_overrides(config, test_run_enabled)
 
     # --- Setup ---
     print(f"[grpo] Platform: {PLATFORM}")
@@ -682,6 +769,8 @@ def run_grpo(config_path: Path | None = None) -> None:
     namespace = hf_auth.resolve_namespace(config, username)
     os.environ["HF_NAMESPACE"] = namespace
     print(f"[grpo] HF namespace: {namespace}")
+    if test_run_enabled:
+        print("[grpo] Test-run mode enabled")
 
     local_dir = WORKING_DIR / "grpo_run"
     local_dir.mkdir(parents=True, exist_ok=True)
@@ -761,8 +850,13 @@ def main() -> None:
         default=None,
         help="Path to config.yaml (default: firewatch_agent/config.yaml)",
     )
+    parser.add_argument(
+        "--test-run",
+        action="store_true",
+        help="Run one tiny GRPO smoke test and write artifacts under test/.",
+    )
     args = parser.parse_args()
-    run_grpo(config_path=args.config)
+    run_grpo(config_path=args.config, test_run=args.test_run)
 
 
 if __name__ == "__main__":
