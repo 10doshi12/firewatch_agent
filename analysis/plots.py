@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
+
+_MPLCONFIGDIR = Path(tempfile.gettempdir()) / "firewatch_matplotlib"
+_MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_MPLCONFIGDIR))
+_XDG_CACHE_HOME = Path(tempfile.gettempdir()) / "firewatch_cache"
+_XDG_CACHE_HOME.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("XDG_CACHE_HOME", str(_XDG_CACHE_HOME))
 
 import matplotlib
 
